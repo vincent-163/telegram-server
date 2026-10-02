@@ -1,0 +1,22 @@
+[Unit]
+Description=Standalone Rust Telegram MTProto server and Bot API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=telegram-server
+Group=telegram-server
+WorkingDirectory=/var/lib/telegram-server
+ExecStart=/usr/local/bin/telegram-server --db /var/lib/telegram-server/telegram-server.db --rsa-key /var/lib/telegram-server/telegram-server-rsa.key --public-ip 192.168.37.27 --mtproto-bind 0.0.0.0 --mtproto-port 24443 --bot-bind 0.0.0.0 --bot-port 28081 --login-code 12345
+Restart=on-failure
+RestartSec=3s
+LimitNOFILE=65536
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/telegram-server
+
+[Install]
+WantedBy=multi-user.target
