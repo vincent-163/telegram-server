@@ -4,6 +4,7 @@ pub mod botapi;
 pub mod config;
 pub mod connection;
 pub mod crypto;
+pub mod http_mtproto;
 pub mod mtproto;
 pub mod rpc;
 pub mod store;

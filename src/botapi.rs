@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Result};
 use axum::body::{to_bytes, Body};
-use axum::extract::{Path, State};
+use axum::extract::{DefaultBodyLimit, Path, State};
 use axum::http::{Request, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get};
@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::config::Config;
+use crate::http_mtproto::{self, HttpMtProtoState};
 use crate::mtproto::RsaKeyPair;
 use crate::store::{now, Store, UserRow};
 
@@ -18,15 +19,19 @@ pub struct AppState {
     pub store: Store,
     pub cfg: Arc<Config>,
     pub rsa: RsaKeyPair,
+    pub http_mtproto: Arc<HttpMtProtoState>,
 }
 
 pub fn router(state: AppState) -> Router {
     Router::new()
+        .route("/apiw1", any(http_mtproto::handle))
+        .route("/apiw_test1", any(http_mtproto::handle))
         .route("/healthz", get(|| async { "ok" }))
         .route("/server-key", get(server_key))
         .route("/serverPublicKey", get(server_key))
         .route("/bot:token/:method", any(bot_route))
         .route("/file/bot:token/:file_id", get(file_route))
+        .layer(DefaultBodyLimit::max(16 * 1024 * 1024))
         .with_state(state)
 }
 

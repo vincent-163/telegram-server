@@ -210,6 +210,7 @@ async fn main() -> Result<()> {
         store: store.clone(),
         cfg: cfg.clone(),
         rsa: rsa.clone(),
+        http_mtproto: Arc::new(telegram_server::http_mtproto::HttpMtProtoState::new()),
     };
     let bot_listener = tokio::net::TcpListener::bind((cfg.bot_api_bind.as_str(), cfg.bot_api_port))
         .await
