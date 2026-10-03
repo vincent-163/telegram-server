@@ -1155,7 +1155,25 @@ impl Store {
 
     pub fn bump_pts(&self, user_id: i64) -> Result<(i32, i32)> {
         let conn = self.conn();
-        let (pts, _, _, _) = self.state_for(user_id)?;
+        // Read the current pts inline: `state_for` takes the same
+        // non-reentrant connection guard, so calling it here would deadlock.
+        let existing: Option<i32> = conn
+            .query_row(
+                "SELECT pts FROM updates_state WHERE user_id = ?1",
+                params![user_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let pts = match existing {
+            Some(pts) => pts,
+            None => {
+                conn.execute(
+                    "INSERT INTO updates_state(user_id,pts,qts,seq,date) VALUES(?1,1,0,1,?2)",
+                    params![user_id, now() as i32],
+                )?;
+                1
+            }
+        };
         let new_pts = pts + 1;
         conn.execute(
             "UPDATE updates_state SET pts = ?1, date = ?2 WHERE user_id = ?3",

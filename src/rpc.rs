@@ -88,12 +88,22 @@ pub fn dispatch(ctx: &mut RpcContext, body: &[u8]) -> Result<Vec<u8>> {
 
 fn dispatch_inner(ctx: &mut RpcContext, body: &[u8], ctor: u32) -> Result<Vec<u8>> {
     use tl::Serializable as _;
+
+    // Every arm below deserializes the *arguments*, i.e. the body without its
+    // leading constructor id. Keep the two in sync rather than silently
+    // parsing the wrong bytes.
+    debug_assert_eq!(
+        u32::from_le_bytes(body[0..4].try_into().unwrap()),
+        ctor,
+        "dispatch_inner called with a body that does not start with ctor"
+    );
+    let args = &body[4..];
     let store = &ctx.store;
 
     match ctor {
         // ---------------------------------------------------------------- ping
         0x7abe77ec => {
-            let f = tl::functions::Ping::deserialize(&mut tl::Cursor::from_slice(body))?;
+            let f = tl::functions::Ping::deserialize(&mut tl::Cursor::from_slice(args))?;
             let pong = tl::types::Pong {
                 msg_id: 0,
                 ping_id: f.ping_id,
@@ -103,12 +113,12 @@ fn dispatch_inner(ctx: &mut RpcContext, body: &[u8], ctor: u32) -> Result<Vec<u8
 
         // ------------------------------------------------------------- help
         0xc4f9186b => {
-            let _ = tl::functions::help::GetConfig::deserialize(&mut tl::Cursor::from_slice(body))?;
+            let _ = tl::functions::help::GetConfig::deserialize(&mut tl::Cursor::from_slice(args))?;
             return Ok(build_config(ctx)?.to_bytes());
         }
         0x1fb33026 => {
             let _ =
-                tl::functions::help::GetNearestDc::deserialize(&mut tl::Cursor::from_slice(body))?;
+                tl::functions::help::GetNearestDc::deserialize(&mut tl::Cursor::from_slice(args))?;
             let nd = tl::types::NearestDc {
                 country: "XX".into(),
                 this_dc: ctx.cfg.dc_id,
@@ -119,11 +129,11 @@ fn dispatch_inner(ctx: &mut RpcContext, body: &[u8], ctor: u32) -> Result<Vec<u8
 
         // ------------------------------------------------------------- auth
         0xa677244f => {
-            let f = tl::functions::auth::SendCode::deserialize(&mut tl::Cursor::from_slice(body))?;
+            let f = tl::functions::auth::SendCode::deserialize(&mut tl::Cursor::from_slice(args))?;
             return handle_send_code(ctx, &f);
         }
         0x8d52a951 => {
-            let f = tl::functions::auth::SignIn::deserialize(&mut tl::Cursor::from_slice(body))?;
+            let f = tl::functions::auth::SignIn::deserialize(&mut tl::Cursor::from_slice(args))?;
             return handle_sign_in(ctx, &f);
         }
         0xaac7b717 => {
@@ -133,7 +143,7 @@ fn dispatch_inner(ctx: &mut RpcContext, body: &[u8], ctor: u32) -> Result<Vec<u8
 
         // ------------------------------------------------------------ users
         0xd91a548 => {
-            let f = tl::functions::users::GetUsers::deserialize(&mut tl::Cursor::from_slice(body))?;
+            let f = tl::functions::users::GetUsers::deserialize(&mut tl::Cursor::from_slice(args))?;
             let mut out = Vec::new();
             for input in &f.id {
                 if let Some(u) = resolve_input_user(store, input)? {
@@ -144,14 +154,14 @@ fn dispatch_inner(ctx: &mut RpcContext, body: &[u8], ctor: u32) -> Result<Vec<u8
         }
         0xb60f5918 => {
             let f =
-                tl::functions::users::GetFullUser::deserialize(&mut tl::Cursor::from_slice(body))?;
+                tl::functions::users::GetFullUser::deserialize(&mut tl::Cursor::from_slice(args))?;
             return handle_get_full_user(ctx, &f);
         }
 
         // ---------------------------------------------------------- account
         0x78515775 => {
             let f = tl::functions::account::UpdateProfile::deserialize(
-                &mut tl::Cursor::from_slice(body),
+                &mut tl::Cursor::from_slice(args),
             )?;
             store.update_profile(
                 ctx.user_id,
@@ -178,123 +188,123 @@ fn dispatch_inner(ctx: &mut RpcContext, body: &[u8], ctor: u32) -> Result<Vec<u8
         }
         0xfef48f62 => {
             let f = tl::functions::messages::SendMessage::deserialize(
-                &mut tl::Cursor::from_slice(body),
+                &mut tl::Cursor::from_slice(args),
             )?;
             return handle_send_message(ctx, &f);
         }
         0xb106e66c => {
             let f = tl::functions::messages::EditMessage::deserialize(
-                &mut tl::Cursor::from_slice(body),
+                &mut tl::Cursor::from_slice(args),
             )?;
             return handle_edit_message(ctx, &f);
         }
         0xe58e95d2 => {
             let f = tl::functions::messages::DeleteMessages::deserialize(
-                &mut tl::Cursor::from_slice(body),
+                &mut tl::Cursor::from_slice(args),
             )?;
             return handle_delete_messages(ctx, &f);
         }
         0xe306d3a => {
             let f = tl::functions::messages::ReadHistory::deserialize(
-                &mut tl::Cursor::from_slice(body),
+                &mut tl::Cursor::from_slice(args),
             )?;
             return handle_read_history(ctx, &f);
         }
         0x63c66506 => {
             // messages.getMessages
             let f = tl::functions::messages::GetMessages::deserialize(
-                &mut tl::Cursor::from_slice(body),
+                &mut tl::Cursor::from_slice(args),
             )?;
             return handle_get_messages(ctx, &f);
         }
-        0xa6f47c87 => {
+        0xaeb00b34 => {
             // messages.getFullChat
             let f = tl::functions::messages::GetFullChat::deserialize(
-                &mut tl::Cursor::from_slice(body),
+                &mut tl::Cursor::from_slice(args),
             )?;
             return handle_get_full_chat_real(ctx, &f);
         }
         // ------------------------------------------------- real handlers
         0xe470bcfd => {
             let f = tl::functions::messages::GetPeerDialogs::deserialize(
-                &mut tl::Cursor::from_slice(body),
+                &mut tl::Cursor::from_slice(args),
             )?;
             return handle_get_peer_dialogs(ctx, &f);
         }
         0xd6b94df2 => return handle_get_pinned_dialogs(ctx),
         0x29ee847a => {
             let f =
-                tl::functions::messages::Search::deserialize(&mut tl::Cursor::from_slice(body))?;
+                tl::functions::messages::Search::deserialize(&mut tl::Cursor::from_slice(args))?;
             return handle_search(ctx, &f);
         }
         0xefd9a6a2 => {
             let f = tl::functions::messages::GetPeerSettings::deserialize(
-                &mut tl::Cursor::from_slice(body),
+                &mut tl::Cursor::from_slice(args),
             )?;
             return handle_get_peer_settings(ctx, &f);
         }
         0x725afbbc => {
             let f = tl::functions::contacts::ResolveUsername::deserialize(
-                &mut tl::Cursor::from_slice(body),
+                &mut tl::Cursor::from_slice(args),
             )?;
             return handle_resolve_username(ctx, &f);
         }
         0x5f58d0f => {
             let f =
-                tl::functions::contacts::Search::deserialize(&mut tl::Cursor::from_slice(body))?;
+                tl::functions::contacts::Search::deserialize(&mut tl::Cursor::from_slice(args))?;
             return handle_contacts_search(ctx, &f);
         }
         0xe40ca104 => {
             let f = tl::functions::messages::GetCommonChats::deserialize(
-                &mut tl::Cursor::from_slice(body),
+                &mut tl::Cursor::from_slice(args),
             )?;
             return handle_get_common_chats(ctx, &f);
         }
         0x49e9528f => {
             let f =
-                tl::functions::messages::GetChats::deserialize(&mut tl::Cursor::from_slice(body))?;
+                tl::functions::messages::GetChats::deserialize(&mut tl::Cursor::from_slice(args))?;
             return handle_get_chats(ctx, &f);
         }
         0xa7f6bbb => {
             let f = tl::functions::channels::GetChannels::deserialize(
-                &mut tl::Cursor::from_slice(body),
+                &mut tl::Cursor::from_slice(args),
             )?;
             return handle_get_channels(ctx, &f);
         }
         0x77ced9d0 => {
             let f = tl::functions::channels::GetParticipants::deserialize(
-                &mut tl::Cursor::from_slice(body),
+                &mut tl::Cursor::from_slice(args),
             )?;
             return handle_get_participants(ctx, &f);
         }
         0x91cd32a8 => {
             let f = tl::functions::photos::GetUserPhotos::deserialize(
-                &mut tl::Cursor::from_slice(body),
+                &mut tl::Cursor::from_slice(args),
             )?;
             return handle_get_user_photos(ctx, &f);
         }
         0x12b3ad31 => {
             let f = tl::functions::account::GetNotifySettings::deserialize(
-                &mut tl::Cursor::from_slice(body),
+                &mut tl::Cursor::from_slice(args),
             )?;
             return handle_get_notify_settings(ctx, &f);
         }
         0x84be5b93 => {
             let f = tl::functions::account::UpdateNotifySettings::deserialize(
-                &mut tl::Cursor::from_slice(body),
+                &mut tl::Cursor::from_slice(args),
             )?;
             return handle_update_notify_settings(ctx, &f);
         }
         0xe320c158 => return handle_get_authorizations(ctx),
         0xbe5335be => {
-            let f = tl::functions::upload::GetFile::deserialize(&mut tl::Cursor::from_slice(body))?;
+            let f = tl::functions::upload::GetFile::deserialize(&mut tl::Cursor::from_slice(args))?;
             return handle_upload_get_file(ctx, &f);
         }
         0x61e3f854 => return handle_get_app_config(ctx),
         0x9cdf08cd => return handle_get_support(ctx),
         0xdf77f3bc => {
             let f = tl::functions::account::ResetAuthorization::deserialize(
-                &mut tl::Cursor::from_slice(body),
+                &mut tl::Cursor::from_slice(args),
             )?;
             return handle_reset_authorization(ctx, f.hash);
         }
@@ -307,7 +317,7 @@ fn dispatch_inner(ctx: &mut RpcContext, body: &[u8], ctor: u32) -> Result<Vec<u8
             ctx.store.drop_all_sessions(ctx.user_id, keep.as_deref())?;
             return Ok(true.to_bytes());
         }
-        0x628006bc => {
+        0x92ceddd4 => {
             // messages.createChat
             let f = tl::functions::messages::CreateChat::deserialize(&mut tl::Cursor::from_slice(
                 body,
@@ -339,7 +349,7 @@ fn dispatch_inner(ctx: &mut RpcContext, body: &[u8], ctor: u32) -> Result<Vec<u8
             };
             return Ok(tl::enums::Updates::Updates(resp).to_bytes());
         }
-        0x9db1bb6d => {
+        0x58943ee2 => {
             // messages.setTyping -> Bool true
             return Ok(true.to_bytes());
         }
@@ -347,12 +357,12 @@ fn dispatch_inner(ctx: &mut RpcContext, body: &[u8], ctor: u32) -> Result<Vec<u8
         // ----------------------------------------------------------- updates
         0xedd4882a => {
             let _ =
-                tl::functions::updates::GetState::deserialize(&mut tl::Cursor::from_slice(body))?;
+                tl::functions::updates::GetState::deserialize(&mut tl::Cursor::from_slice(args))?;
             return handle_get_state(ctx);
         }
         0x19c2f763 => {
             let _f = tl::functions::updates::GetDifference::deserialize(
-                &mut tl::Cursor::from_slice(body),
+                &mut tl::Cursor::from_slice(args),
             )?;
             let (_, _, seq, date) = store.state_for(ctx.user_id)?;
             let empty = tl::types::updates::DifferenceEmpty {
@@ -372,7 +382,7 @@ fn dispatch_inner(ctx: &mut RpcContext, body: &[u8], ctor: u32) -> Result<Vec<u8
         }
         0xde7b673d => {
             let f = tl::functions::upload::SaveBigFilePart::deserialize(
-                &mut tl::Cursor::from_slice(body),
+                &mut tl::Cursor::from_slice(args),
             )?;
             store.put_file_part(f.file_id, f.file_part, &f.bytes)?;
             return Ok(true.to_bytes());
@@ -381,7 +391,7 @@ fn dispatch_inner(ctx: &mut RpcContext, body: &[u8], ctor: u32) -> Result<Vec<u8
         // ---------------------------------------------------------- contacts
         0x5dd69e12 => {
             let _ = tl::functions::contacts::GetContacts::deserialize(
-                &mut tl::Cursor::from_slice(body),
+                &mut tl::Cursor::from_slice(args),
             )?;
             let empty = tl::types::contacts::Contacts {
                 contacts: Vec::new(),
@@ -390,9 +400,9 @@ fn dispatch_inner(ctx: &mut RpcContext, body: &[u8], ctor: u32) -> Result<Vec<u8
             };
             return Ok(tl::enums::contacts::Contacts::Contacts(empty).to_bytes());
         }
-        0x2c800b5f => {
+        0x2c800be5 => {
             let _f = tl::functions::contacts::ImportContacts::deserialize(
-                &mut tl::Cursor::from_slice(body),
+                &mut tl::Cursor::from_slice(args),
             )?;
             let imp = tl::types::contacts::ImportedContacts {
                 imported: Vec::new(),
@@ -402,7 +412,7 @@ fn dispatch_inner(ctx: &mut RpcContext, body: &[u8], ctor: u32) -> Result<Vec<u8
             };
             return Ok(tl::enums::contacts::ImportedContacts::Contacts(imp).to_bytes());
         }
-        0x983b02bb => {
+        0x879537f1 => {
             // contacts.resetSaved
             return Ok(tl::enums::Updates::TooLong.to_bytes());
         }
@@ -410,13 +420,13 @@ fn dispatch_inner(ctx: &mut RpcContext, body: &[u8], ctor: u32) -> Result<Vec<u8
         // ------------------------------------------------------------ langpack
         0x42c6978f => {
             let _f = tl::functions::langpack::GetLanguages::deserialize(
-                &mut tl::Cursor::from_slice(body),
+                &mut tl::Cursor::from_slice(args),
             )?;
             return Ok(Vec::<tl::enums::LangPackLanguage>::new().to_bytes());
         }
-        0x6a596502 => {
+        0xcd984aa5 => {
             let f = tl::functions::langpack::GetDifference::deserialize(
-                &mut tl::Cursor::from_slice(body),
+                &mut tl::Cursor::from_slice(args),
             )?;
             let diff = tl::types::LangPackDifference {
                 lang_code: f.lang_code,
@@ -426,9 +436,9 @@ fn dispatch_inner(ctx: &mut RpcContext, body: &[u8], ctor: u32) -> Result<Vec<u8
             };
             return Ok(diff.to_bytes());
         }
-        0x8479c748 => {
+        0x6a596502 => {
             let _f = tl::functions::langpack::GetLanguage::deserialize(
-                &mut tl::Cursor::from_slice(body),
+                &mut tl::Cursor::from_slice(args),
             )?;
             return bail_rpc(400, "LANG_PACK_LANGUAGE_INVALID");
         }
@@ -663,7 +673,10 @@ fn handle_get_full_user(
     ctx: &RpcContext,
     f: &tl::functions::users::GetFullUser,
 ) -> Result<Vec<u8>> {
-    let target = resolve_user_any(ctx, &f.id)?.ok_or_else(|| anyhow!("user not found"))?;
+    let target = match resolve_user_any(ctx, &f.id)? {
+        Some(u) => u,
+        None => return bail_rpc(400, "USER_ID_INVALID"),
+    };
     let mut chats = Vec::new();
     let users = vec![build_user(ctx, &target)?];
     let common = ctx.store.chat_members_shared(ctx.user_id, target.id)?;
@@ -839,7 +852,10 @@ fn handle_get_common_chats(
     ctx: &RpcContext,
     f: &tl::functions::messages::GetCommonChats,
 ) -> Result<Vec<u8>> {
-    let other = resolve_user_any(ctx, &f.user_id)?.ok_or_else(|| anyhow!("user not found"))?;
+    let other = match resolve_user_any(ctx, &f.user_id)? {
+        Some(u) => u,
+        None => return bail_rpc(400, "USER_ID_INVALID"),
+    };
     let common = ctx.store.chat_members_shared(ctx.user_id, other.id)?;
     let mut chats = Vec::new();
     for c in &common {
@@ -866,10 +882,10 @@ fn handle_get_full_chat_real(
     ctx: &RpcContext,
     f: &tl::functions::messages::GetFullChat,
 ) -> Result<Vec<u8>> {
-    let chat = ctx
-        .store
-        .get_chat(f.chat_id)?
-        .ok_or_else(|| anyhow!("chat not found"))?;
+    let chat = match ctx.store.get_chat(f.chat_id)? {
+        Some(c) => c,
+        None => return bail_rpc(400, "CHAT_ID_INVALID"),
+    };
     let members = ctx.store.chat_members(chat.id)?;
     let mut participants = Vec::new();
     let mut users = Vec::new();
@@ -1039,7 +1055,8 @@ fn handle_get_authorizations(ctx: &RpcContext) -> Result<Vec<u8>> {
     Ok(tl::enums::account::Authorizations::Authorizations(resp).to_bytes())
 }
 
-/// `account.resetAuthorization` / `account.resetAuthorizations`.
+/// `account.resetAuthorization` (0xdf77f3bc) and
+/// `auth.resetAuthorizations` (0x9fab0d1a).
 fn handle_reset_authorization(ctx: &RpcContext, hash: i64) -> Result<Vec<u8>> {
     let sessions = ctx.store.sessions_for_user(ctx.user_id)?;
     let target = sessions

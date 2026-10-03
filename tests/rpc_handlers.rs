@@ -1,0 +1,548 @@
+//! End-to-end tests for the hand-written RPC handlers.
+//!
+//! These drive `rpc::dispatch` with real serialized TL function bodies and
+//! parse the replies back with the declared return types, so a handler that
+//! returns the wrong shape fails here rather than in a client.
+
+use grammers_tl_types as tl;
+use grammers_tl_types::{Deserializable, Serializable};
+use std::path::PathBuf;
+use std::sync::Arc;
+use telegram_server::config::Config;
+use telegram_server::rpc::{dispatch, RpcContext};
+use telegram_server::store::Store;
+
+struct Fixture {
+    ctx: RpcContext,
+    _dir: PathBuf,
+}
+
+fn setup() -> Fixture {
+    let dir = std::env::temp_dir().join(format!("tgsrv-test-{}", rand::random::<u64>()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let store = Store::open(&dir.join("test.db")).unwrap();
+    let cfg = Arc::new(Config::new(
+        2,
+        Some("192.168.37.27".into()),
+        None,
+        "0.0.0.0".into(),
+        24443,
+        "0.0.0.0".into(),
+        28081,
+        dir.join("test.db"),
+        dir.join("key.pem"),
+        None,
+        Some("12345".into()),
+    ));
+    let self_user = store
+        .create_user("15550000001", "Admin", "User", "admin", false, true)
+        .unwrap();
+    let peer = store
+        .create_user("15550000002", "Peer", "Person", "peeruser", false, false)
+        .unwrap();
+    let chat = store.create_chat("Test Group", self_user.id).unwrap();
+    store
+        .add_chat_member(chat.id, self_user.id, "creator")
+        .unwrap();
+    store.add_chat_member(chat.id, peer.id, "member").unwrap();
+    let ctx = RpcContext {
+        store,
+        cfg,
+        auth_key_id: 42,
+        user_id: self_user.id,
+        layer: 181,
+    };
+    Fixture { ctx, _dir: dir }
+}
+
+fn call<F: Serializable, T: Deserializable>(ctx: &mut RpcContext, f: &F) -> T {
+    let body = match dispatch(ctx, &f.to_bytes()) {
+        Ok(b) => b,
+        Err(e) => panic!("dispatch failed: {e:?}"),
+    };
+    let mut cur = tl::Cursor::from_slice(&body);
+    let out = T::deserialize(&mut cur).expect("reply did not parse");
+    assert_eq!(cur.pos(), body.len(), "reply left trailing bytes");
+    out
+}
+
+#[test]
+fn users_get_full_user_returns_profile() {
+    let mut fx = setup();
+    let me = fx.ctx.user_id;
+    let f = tl::functions::users::GetFullUser {
+        id: tl::enums::InputUser::User(tl::types::InputUser {
+            user_id: me,
+            access_hash: 0,
+        }),
+    };
+    let out: tl::enums::users::UserFull = call(&mut fx.ctx, &f);
+    let tl::enums::users::UserFull::Full(full) = out else {
+        panic!("expected users::UserFull::Full")
+    };
+    let tl::enums::UserFull::Full(inner) = full.full_user else {
+        panic!("expected UserFull::Full")
+    };
+    assert_eq!(inner.id, me);
+    assert_eq!(full.users.len(), 1);
+    // The shared test group is reported as a common chat.
+    assert_eq!(inner.common_chats_count, 1);
+}
+
+#[test]
+fn contacts_resolve_username_finds_peer() {
+    let mut fx = setup();
+    let f = tl::functions::contacts::ResolveUsername {
+        username: "peeruser".into(),
+        referer: None,
+    };
+    let out: tl::enums::contacts::ResolvedPeer = call(&mut fx.ctx, &f);
+    let tl::enums::contacts::ResolvedPeer::Peer(res) = out else {
+        panic!("expected ResolvedPeer::Peer")
+    };
+    assert!(matches!(res.peer, tl::enums::Peer::User(_)));
+    assert_eq!(res.users.len(), 1);
+}
+
+#[test]
+fn contacts_resolve_username_rejects_unknown() {
+    let mut fx = setup();
+    let f = tl::functions::contacts::ResolveUsername {
+        username: "nobody".into(),
+        referer: None,
+    };
+    let err = dispatch(&mut fx.ctx, &f.to_bytes()).unwrap_err();
+    let rpc = telegram_server::rpc::as_rpc_error(&err).expect("expected an rpc_error");
+    assert_eq!(rpc.code, 400);
+    assert_eq!(rpc.message, "USERNAME_NOT_OCCUPIED");
+}
+
+#[test]
+fn contacts_search_matches_name() {
+    let mut fx = setup();
+    let f = tl::functions::contacts::Search {
+        broadcasts: false,
+        bots: false,
+        q: "peer".into(),
+        limit: 10,
+    };
+    let out: tl::enums::contacts::Found = call(&mut fx.ctx, &f);
+    let tl::enums::contacts::Found::Found(found) = out else {
+        panic!("expected contacts::Found::Found")
+    };
+    assert_eq!(found.results.len(), 1);
+}
+
+#[test]
+fn messages_get_peer_dialogs_reports_dialogs() {
+    let mut fx = setup();
+    let peer_id = fx
+        .ctx
+        .store
+        .get_user_by_username("peeruser")
+        .unwrap()
+        .unwrap()
+        .id;
+    let f = tl::functions::messages::GetPeerDialogs {
+        peers: vec![tl::enums::InputDialogPeer::Peer(
+            tl::types::InputDialogPeer {
+                peer: tl::enums::InputPeer::User(tl::types::InputPeerUser {
+                    user_id: peer_id,
+                    access_hash: 0,
+                }),
+            },
+        )],
+    };
+    let out: tl::enums::messages::PeerDialogs = call(&mut fx.ctx, &f);
+    let tl::enums::messages::PeerDialogs::Dialogs(d) = out else {
+        panic!("expected PeerDialogs::Dialogs")
+    };
+    // No messages were sent, so no dialog rows exist yet; the reply must
+    // still be a well-formed PeerDialogs carrying the update state.
+    let tl::enums::updates::State::State(state) = d.state else {
+        panic!("expected updates::State::State")
+    };
+    assert!(state.pts >= 1);
+}
+
+#[test]
+fn messages_send_then_search_and_get_messages() {
+    let mut fx = setup();
+    let peer_id = fx
+        .ctx
+        .store
+        .get_user_by_username("peeruser")
+        .unwrap()
+        .unwrap()
+        .id;
+    let send = tl::functions::messages::SendMessage {
+        no_webpage: false,
+        silent: false,
+        background: false,
+        clear_draft: false,
+        noforwards: false,
+        update_stickersets_order: false,
+        invert_media: false,
+        allow_paid_floodskip: false,
+        peer: tl::enums::InputPeer::User(tl::types::InputPeerUser {
+            user_id: peer_id,
+            access_hash: 0,
+        }),
+        reply_to: None,
+        random_id: 7,
+        message: "hello searchable world".into(),
+        reply_markup: None,
+        entities: None,
+        schedule_date: None,
+        send_as: None,
+        quick_reply_shortcut: None,
+        effect: None,
+        allow_paid_stars: None,
+        suggested_post: None,
+        schedule_repeat_period: None,
+        rich_message: None,
+    };
+    let _: tl::enums::Updates = call(&mut fx.ctx, &send);
+
+    let search = tl::functions::messages::Search {
+        peer: tl::enums::InputPeer::User(tl::types::InputPeerUser {
+            user_id: peer_id,
+            access_hash: 0,
+        }),
+        q: "searchable".into(),
+        from_id: None,
+        saved_peer_id: None,
+        saved_reaction: None,
+        top_msg_id: None,
+        filter: tl::enums::MessagesFilter::InputMessagesFilterEmpty,
+        min_date: 0,
+        max_date: 0,
+        offset_id: 0,
+        add_offset: 0,
+        limit: 20,
+        max_id: 0,
+        min_id: 0,
+        hash: 0,
+    };
+    let out: tl::enums::messages::Messages = call(&mut fx.ctx, &search);
+    let tl::enums::messages::Messages::Messages(m) = out else {
+        panic!("expected messages::Messages::Messages")
+    };
+    assert_eq!(m.messages.len(), 1, "search should find the sent message");
+
+    // A search for text that was never sent must come back empty.
+    let miss = tl::functions::messages::Search {
+        q: "definitely-not-present".into(),
+        ..search
+    };
+    let out: tl::enums::messages::Messages = call(&mut fx.ctx, &miss);
+    let tl::enums::messages::Messages::Messages(m) = out else {
+        panic!("expected messages::Messages::Messages")
+    };
+    assert!(m.messages.is_empty());
+}
+
+#[test]
+fn messages_get_full_chat_lists_participants() {
+    let mut fx = setup();
+    let peer_id = fx
+        .ctx
+        .store
+        .get_user_by_username("peeruser")
+        .unwrap()
+        .unwrap()
+        .id;
+    let chat = fx
+        .ctx
+        .store
+        .chat_members_shared(fx.ctx.user_id, peer_id)
+        .unwrap()[0]
+        .clone();
+    let f = tl::functions::messages::GetFullChat { chat_id: chat.id };
+    let out: tl::enums::messages::ChatFull = call(&mut fx.ctx, &f);
+    let tl::enums::messages::ChatFull::Full(full) = out else {
+        panic!("expected ChatFull::Full")
+    };
+    let tl::enums::ChatFull::Full(inner) = full.full_chat else {
+        panic!("expected ChatFull::Full")
+    };
+    let tl::enums::ChatParticipants::Participants(p) = inner.participants else {
+        panic!("expected ChatParticipants::Participants")
+    };
+    assert_eq!(p.participants.len(), 2);
+    assert_eq!(full.users.len(), 2);
+}
+
+#[test]
+fn account_notify_settings_round_trip() {
+    let mut fx = setup();
+    let settings =
+        tl::enums::InputPeerNotifySettings::Settings(tl::types::InputPeerNotifySettings {
+            show_previews: Some(false),
+            silent: Some(true),
+            mute_until: Some(3600),
+            sound: None,
+            stories_muted: Some(true),
+            stories_hide_sender: None,
+            stories_sound: None,
+        });
+    let peer = tl::enums::InputNotifyPeer::InputNotifyUsers;
+    let upd = tl::functions::account::UpdateNotifySettings {
+        peer: peer.clone(),
+        settings,
+    };
+    let ok: bool = call(&mut fx.ctx, &upd);
+    assert!(ok);
+
+    let get = tl::functions::account::GetNotifySettings { peer };
+    let out: tl::enums::PeerNotifySettings = call(&mut fx.ctx, &get);
+    let tl::enums::PeerNotifySettings::Settings(s) = out else {
+        panic!("expected PeerNotifySettings::Settings")
+    };
+    assert_eq!(s.show_previews, Some(false));
+    assert_eq!(s.silent, Some(true));
+    assert_eq!(s.mute_until, Some(3600));
+    assert_eq!(s.stories_muted, Some(true));
+}
+
+#[test]
+fn account_authorizations_are_listed() {
+    let mut fx = setup();
+    fx.ctx
+        .store
+        .save_session("sess-1", fx.ctx.user_id, 42, "Desktop", "Linux", 1, 3600)
+        .unwrap();
+    let f = tl::functions::account::GetAuthorizations {};
+    let out: tl::enums::account::Authorizations = call(&mut fx.ctx, &f);
+    let tl::enums::account::Authorizations::Authorizations(a) = out else {
+        panic!("expected account::Authorizations::Authorizations")
+    };
+    assert_eq!(a.authorizations.len(), 1);
+}
+
+#[test]
+fn help_app_config_and_support_respond() {
+    let mut fx = setup();
+    let f = tl::functions::help::GetAppConfig { hash: 0 };
+    let out: tl::enums::help::AppConfig = call(&mut fx.ctx, &f);
+    assert!(matches!(out, tl::enums::help::AppConfig::Config(_)));
+
+    let f = tl::functions::help::GetSupport {};
+    let out: tl::enums::help::Support = call(&mut fx.ctx, &f);
+    let tl::enums::help::Support::Support(s) = out else {
+        panic!("expected help::Support::Support")
+    };
+    assert!(matches!(s.user, tl::enums::User::User(_)));
+}
+
+#[test]
+fn upload_get_file_serves_stored_blob() {
+    let mut fx = setup();
+    fx.ctx
+        .store
+        .put_blob("blob:99", "note.txt", "text/plain", b"payload-bytes")
+        .unwrap();
+    let f = tl::functions::upload::GetFile {
+        precise: false,
+        cdn_supported: false,
+        location: tl::enums::InputFileLocation::Location(tl::types::InputFileLocation {
+            volume_id: 99,
+            local_id: 0,
+            secret: 0,
+            file_reference: Vec::new(),
+        }),
+        offset: 0,
+        limit: 1024,
+    };
+    let out: tl::enums::upload::File = call(&mut fx.ctx, &f);
+    let tl::enums::upload::File::File(file) = out else {
+        panic!("expected upload::File::File")
+    };
+    assert_eq!(file.bytes, b"payload-bytes");
+
+    // A range request returns just the requested slice.
+    let f = tl::functions::upload::GetFile {
+        offset: 8,
+        limit: 5,
+        ..f
+    };
+    let out: tl::enums::upload::File = call(&mut fx.ctx, &f);
+    let tl::enums::upload::File::File(file) = out else {
+        panic!("expected upload::File::File")
+    };
+    assert_eq!(file.bytes, b"bytes");
+}
+
+#[test]
+fn excluded_namespaces_return_rpc_errors() {
+    let mut fx = setup();
+    // payments.getPaymentForm is deliberately not stubbed.
+    let body = 0x37148dbbu32.to_le_bytes();
+    let err = dispatch(&mut fx.ctx, &body).unwrap_err();
+    let rpc = telegram_server::rpc::as_rpc_error(&err).expect("expected an rpc_error");
+    assert_eq!(rpc.code, 400);
+    assert!(rpc.message.contains("unsupported"), "{}", rpc.message);
+}
+
+#[test]
+fn unknown_ctor_returns_rpc_error() {
+    let mut fx = setup();
+    let body = 0xdeadbeefu32.to_le_bytes();
+    let err = dispatch(&mut fx.ctx, &body).unwrap_err();
+    assert!(telegram_server::rpc::as_rpc_error(&err).is_some());
+}
+
+// --------------------------------------------------------------------------
+// Constructor-id regressions.
+//
+// Each arm of `dispatch_inner` is keyed by a raw constructor id, so a wrong
+// id silently routes a method to another method's handler (or to the generic
+// compatibility fallback). These tests send the id declared by
+// `grammers-tl-types` and assert the arm that actually handles it, which is
+// what caught messages.getFullChat / createChat / importContacts /
+// langpack.getDifference / langpack.getLanguage / setTyping / resetSaved
+// pointing at ids that belonged to other methods.
+// --------------------------------------------------------------------------
+
+#[test]
+fn typed_arms_are_reachable_by_declared_ctor() {
+    use tl::Identifiable;
+    let mut fx = setup();
+
+    // messages.getFullChat#aeb00b34 -- must reach the chat handler, not the
+    // generic fallback (a stale 0xa6f47c87 used to route it elsewhere).
+    assert_eq!(
+        <tl::functions::messages::GetFullChat as Identifiable>::CONSTRUCTOR_ID,
+        0xaeb00b34
+    );
+    // A missing chat is a clean RPC error...
+    let f = tl::functions::messages::GetFullChat { chat_id: 1 };
+    let err = dispatch(&mut fx.ctx, &f.to_bytes()).unwrap_err();
+    let rpc = telegram_server::rpc::as_rpc_error(&err).expect("expected an rpc_error");
+    assert_eq!(rpc.message, "CHAT_ID_INVALID");
+
+    // ...and a real chat reaches the chat handler with a parseable reply.
+    let peer_id = fx
+        .ctx
+        .store
+        .get_user_by_username("peeruser")
+        .unwrap()
+        .unwrap()
+        .id;
+    let chat = fx
+        .ctx
+        .store
+        .chat_members_shared(fx.ctx.user_id, peer_id)
+        .unwrap()[0]
+        .clone();
+    let f = tl::functions::messages::GetFullChat { chat_id: chat.id };
+    let body = dispatch(&mut fx.ctx, &f.to_bytes()).expect("getFullChat must dispatch");
+    let mut cur = tl::Cursor::from_slice(&body);
+    tl::enums::messages::ChatFull::deserialize(&mut cur).expect("getFullChat reply must parse");
+}
+
+#[test]
+fn contacts_import_contacts_ctor_is_reachable() {
+    use tl::Identifiable;
+    let mut fx = setup();
+    let f = tl::functions::contacts::ImportContacts {
+        contacts: Vec::new(),
+    };
+    assert_eq!(
+        <tl::functions::contacts::ImportContacts as Identifiable>::CONSTRUCTOR_ID,
+        0x2c800be5
+    );
+    let body = dispatch(&mut fx.ctx, &f.to_bytes()).expect("importContacts must dispatch");
+    let mut cur = tl::Cursor::from_slice(&body);
+    tl::enums::contacts::ImportedContacts::deserialize(&mut cur)
+        .expect("importContacts reply must parse");
+}
+
+#[test]
+fn langpack_ctors_are_distinct() {
+    use tl::Identifiable;
+    assert_eq!(
+        <tl::functions::langpack::GetDifference as Identifiable>::CONSTRUCTOR_ID,
+        0xcd984aa5
+    );
+    assert_eq!(
+        <tl::functions::langpack::GetLanguage as Identifiable>::CONSTRUCTOR_ID,
+        0x6a596502
+    );
+    let mut fx = setup();
+    // getLanguage for an unknown pack must be a clean RPC error, not a
+    // mis-parsed success produced by the getDifference arm.
+    let f = tl::functions::langpack::GetLanguage {
+        lang_pack: "android".into(),
+        lang_code: "en".into(),
+    };
+    let err = dispatch(&mut fx.ctx, &f.to_bytes()).unwrap_err();
+    let rpc = telegram_server::rpc::as_rpc_error(&err).expect("expected an rpc_error");
+    assert_eq!(rpc.message, "LANG_PACK_LANGUAGE_INVALID");
+}
+
+#[test]
+fn messages_get_chats_and_read_history_dispatch() {
+    use tl::Identifiable;
+    let mut fx = setup();
+    assert_eq!(
+        <tl::functions::messages::GetChats as Identifiable>::CONSTRUCTOR_ID,
+        0x49e9528f
+    );
+    assert_eq!(
+        <tl::functions::messages::ReadHistory as Identifiable>::CONSTRUCTOR_ID,
+        0x0e306d3a
+    );
+    let peer_id = fx
+        .ctx
+        .store
+        .get_user_by_username("peeruser")
+        .unwrap()
+        .unwrap()
+        .id;
+    let f = tl::functions::messages::ReadHistory {
+        peer: tl::enums::InputPeer::User(tl::types::InputPeerUser {
+            user_id: peer_id,
+            access_hash: 0,
+        }),
+        max_id: 0,
+    };
+    let out: tl::enums::messages::AffectedHistory = call(&mut fx.ctx, &f);
+    let tl::enums::messages::AffectedHistory::History(h) = out else {
+        panic!("expected AffectedHistory::History")
+    };
+    assert!(h.pts >= 1);
+}
+
+#[test]
+fn auth_reset_authorizations_clears_other_sessions() {
+    let mut fx = setup();
+    fx.ctx
+        .store
+        .save_session("sess-keep", fx.ctx.user_id, 42, "Desktop", "Linux", 1, 3600)
+        .unwrap();
+    fx.ctx
+        .store
+        .save_session("sess-drop", fx.ctx.user_id, 77, "Phone", "Android", 1, 3600)
+        .unwrap();
+    assert_eq!(fx.ctx.store.count_sessions(fx.ctx.user_id).unwrap(), 2);
+    let f = tl::functions::auth::ResetAuthorizations {};
+    let ok: bool = call(&mut fx.ctx, &f);
+    assert!(ok);
+    // The current session is kept, the other one is dropped.
+    assert_eq!(fx.ctx.store.count_sessions(fx.ctx.user_id).unwrap(), 1);
+}
+
+#[test]
+fn account_update_profile_writes_through() {
+    let mut fx = setup();
+    let f = tl::functions::account::UpdateProfile {
+        first_name: Some("Renamed".into()),
+        last_name: None,
+        about: Some("bio".into()),
+    };
+    let _: tl::enums::User = call(&mut fx.ctx, &f);
+    let me = fx.ctx.store.get_user(fx.ctx.user_id).unwrap().unwrap();
+    assert_eq!(me.first_name, "Renamed");
+    assert_eq!(me.about, "bio");
+}
