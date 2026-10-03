@@ -116,10 +116,6 @@ impl RsaKeyPair {
     pub fn public_pem_rsa(&self) -> String {
         wrap_pem("RSA PUBLIC KEY", &self.pkcs1_der())
     }
-
-    fn modulus_for_der(&self) -> BigUint {
-        self.n.clone()
-    }
 }
 
 impl RsaKeyPair {
