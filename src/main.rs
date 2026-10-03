@@ -133,8 +133,20 @@ fn load_or_create_rsa_key(path: &std::path::Path) -> Result<RsaKeyPair> {
             .with_context(|| format!("parse RSA key {}", path.display())),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             let key = RsaKeyPair::generate();
-            std::fs::write(path, key.to_hex())
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create(true).truncate(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let mut file = options
+                .open(path)
                 .with_context(|| format!("write RSA key {}", path.display()))?;
+            use std::io::Write;
+            file.write_all(key.to_hex().as_bytes())
+                .with_context(|| format!("write RSA key {}", path.display()))?;
+            drop(file);
             set_key_permissions(path)?;
             tracing::info!("created persistent MTProto RSA key at {}", path.display());
             Ok(key)
@@ -192,7 +204,17 @@ async fn main() -> Result<()> {
                     .cloned()
                     .unwrap_or_else(|| cfg.rsa_key_path.to_string_lossy().into_owned());
                 let key = RsaKeyPair::generate();
-                std::fs::write(&out, key.to_hex())?;
+                let mut options = std::fs::OpenOptions::new();
+                options.write(true).create(true).truncate(true);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    options.mode(0o600);
+                }
+                let mut file = options.open(&out)?;
+                use std::io::Write;
+                file.write_all(key.to_hex().as_bytes())?;
+                drop(file);
                 set_key_permissions(Path::new(&out))?;
                 println!("{}", key.public_pem());
             }
