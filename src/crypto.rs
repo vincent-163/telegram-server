@@ -323,6 +323,29 @@ pub fn rsa_encrypt_hashed(data: &[u8], key: &RsaPublicKey, random: &[u8; 224]) -
     }
 }
 
+/// The legacy `RSA_PAD` encryption used by Telethon, TDLib and the official
+/// clients: `sha1(data) || data || random padding`, RSA-encoded big-endian.
+pub fn rsa_encrypt_legacy(data: &[u8], key: &RsaPublicKey, random: &[u8; 224]) -> Result<Vec<u8>> {
+    if data.len() > 235 {
+        bail!("data too long for legacy RSA padding: {}", data.len());
+    }
+    let mut block = Vec::with_capacity(255);
+    block.extend_from_slice(&sha1(data));
+    block.extend_from_slice(data);
+    block.extend_from_slice(&random[..235 - data.len()]);
+    debug_assert_eq!(block.len(), 255);
+    let m = BigUint::from_bytes_be(&block);
+    if m >= key.modulus {
+        bail!("legacy RSA block is not smaller than the modulus");
+    }
+    let enc = m.modpow(&key.exponent, &key.modulus);
+    let mut out = enc.to_bytes_be();
+    while out.len() < 256 {
+        out.insert(0, 0);
+    }
+    Ok(out)
+}
+
 /// Deterministic small-prime-safe random 128-bit `p * q` product split.
 /// `pq` must be a product of two distinct primes < 2^63.
 pub fn factorize_pq(pq: u64) -> (u64, u64) {

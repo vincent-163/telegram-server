@@ -1,6 +1,6 @@
 //! MTProto 2.0 authorization-key handshake, message framing and encryption.
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use grammers_tl_types as tl;
 use grammers_tl_types::{Deserializable, Serializable};
 use num_bigint::{BigInt, BigUint, RandBigInt};
@@ -241,6 +241,70 @@ pub fn is_probable_prime_big(n: &BigUint) -> bool {
     true
 }
 
+/// Strips the `RSA_PAD_HASHED` framing from a decrypted `p_q_inner_data`
+/// block: `temp_key(32) || AES-IGE(reversed data||padding || sha256(temp_key||data||padding))`.
+///
+/// The block was RSA-encoded as a big-endian integer, so leading zero bytes may
+/// have been dropped; the scheme always produces a 256-byte plaintext, hence
+/// the tail of the decrypted buffer is the exact block.
+fn unpad_hashed(raw: &[u8]) -> Result<Vec<u8>> {
+    if raw.len() < 256 {
+        bail!("unexpected RSA plaintext length {}", raw.len());
+    }
+    let raw = &raw[raw.len() - 256..];
+    let aes_encrypted = &raw[32..256];
+    let temp_key_xor: [u8; 32] = raw[0..32].try_into().unwrap();
+    let mut temp_key = temp_key_xor;
+    let h = sha256(aes_encrypted);
+    for i in 0..32 {
+        temp_key[i] ^= h[i];
+    }
+    let mut data_hash = aes_encrypted.to_vec();
+    ige_decrypt(&mut data_hash, &temp_key, &[0u8; 32]);
+    let mut data_with_padding = data_hash[..192].to_vec();
+    let hash = data_hash[192..].to_vec();
+    data_with_padding.reverse();
+    let expected = sha256_concat(&[&temp_key, &data_with_padding]);
+    if hash[..] != expected[..] {
+        bail!("p_q_inner_data hash mismatch");
+    }
+    Ok(data_with_padding)
+}
+
+/// Strips the legacy `RSA_PAD` framing: `sha1(data) || data || random padding`,
+/// as produced by Telethon, TDLib and the official mobile/desktop clients.
+///
+/// The plaintext is always `20 + data + (235 - data)` = 255 bytes, so the tail
+/// of the decrypted buffer is the exact block even when the integer encoding
+/// dropped a leading zero byte.
+fn unpad_legacy(raw: &[u8]) -> Result<Vec<u8>> {
+    if raw.len() < 255 {
+        bail!("unexpected RSA plaintext length {}", raw.len());
+    }
+    let block = &raw[raw.len() - 255..];
+    let hash = &block[..20];
+    let body = &block[20..];
+    if body.len() < 4 {
+        bail!("legacy p_q_inner_data too short");
+    }
+    let ctor = u32::from_le_bytes(body[0..4].try_into().unwrap());
+    if !matches!(ctor, 0x83c95aec | 0xa9f55f95 | 0x3c6a84d4 | 0x56fddf88) {
+        bail!(
+            "legacy p_q_inner_data has unknown constructor {:#010x}",
+            ctor
+        );
+    }
+    let mut cursor = grammers_tl_types::Cursor::from_slice(body);
+    let inner = tl::enums::PQInnerData::deserialize(&mut cursor)
+        .map_err(|e| anyhow!("bad legacy p_q_inner_data: {}", e))?;
+    let end = cursor.pos();
+    if sha1(&body[..end])[..] != hash[..] {
+        bail!("legacy p_q_inner_data hash mismatch");
+    }
+    let _ = inner;
+    Ok(body[..end].to_vec())
+}
+
 /// Server-side handshake state.
 pub struct Handshake {
     pub nonce: [u8; 16],
@@ -333,31 +397,23 @@ impl Handshake {
             bail!("p*q does not match pq");
         }
 
-        // RSA-decrypt the p_q_inner_data blob.
+        // RSA-decrypt the p_q_inner_data blob. Clients use either the modern
+        // RSA_PAD_HASHED scheme or the legacy RSA_PAD one, so try both.
         let raw = key.decrypt_block(&req.encrypted_data)?;
-        let aes_encrypted = &raw[32..256];
-        let temp_key_xor: [u8; 32] = raw[0..32].try_into().unwrap();
-        let mut temp_key = temp_key_xor;
-        let h = sha256(aes_encrypted);
-        for i in 0..32 {
-            temp_key[i] ^= h[i];
-        }
-        let mut data_hash = aes_encrypted.to_vec();
-        ige_decrypt(&mut data_hash, &temp_key, &[0u8; 32]);
-        if data_hash.len() != 224 {
-            bail!("invalid p_q_inner_data padding length");
-        }
-        let mut data_with_padding = data_hash[..192].to_vec();
-        let hash = data_hash[192..].to_vec();
-        data_with_padding.reverse();
-        let expected = sha256_concat(&[&temp_key, &data_with_padding]);
-        if hash[..] != expected[..] {
-            bail!("p_q_inner_data hash mismatch");
-        }
-        let inner = tl::types::PQInnerData::deserialize(
+        let data_with_padding = if let Ok(v) = unpad_hashed(&raw) {
+            v
+        } else {
+            unpad_legacy(&raw).context("p_q_inner_data could not be unpadded")?
+        };
+        let inner = tl::enums::PQInnerData::deserialize(
             &mut grammers_tl_types::Cursor::from_slice(&data_with_padding),
         )?;
-        let new_nonce: [u8; 32] = inner.new_nonce;
+        let new_nonce: [u8; 32] = inner.new_nonce();
+        let inner_nonce: [u8; 16] = inner.nonce();
+        let inner_server_nonce: [u8; 16] = inner.server_nonce();
+        if inner_nonce != self.nonce || inner_server_nonce != server_nonce {
+            bail!("p_q_inner_data nonce mismatch");
+        }
 
         // Generate DH parameters.
         let dh_prime = dh_prime();
@@ -371,18 +427,17 @@ impl Handshake {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs() as i32)
             .unwrap_or(0);
-        let mut answer = Vec::new();
-        answer.extend_from_slice(
-            &tl::types::ServerDhInnerData {
-                nonce: self.nonce,
-                server_nonce,
-                g: DH_GENERATOR as i32,
-                dh_prime: dh_prime_bytes(),
-                g_a: g_b.to_bytes_be(),
-                server_time,
-            }
-            .to_bytes(),
-        );
+        // The inner data is read by the client as a standalone TL object, so
+        // its constructor id must be present.
+        let mut answer = tl::enums::ServerDhInnerData::Data(tl::types::ServerDhInnerData {
+            nonce: self.nonce,
+            server_nonce,
+            g: DH_GENERATOR as i32,
+            dh_prime: dh_prime_bytes(),
+            g_a: g_b.to_bytes_be(),
+            server_time,
+        })
+        .to_bytes();
         let mut answer_with_hash = Vec::with_capacity(20 + answer.len() + 16);
         answer_with_hash.extend_from_slice(&sha1(&answer));
         answer_with_hash.extend_from_slice(&answer);
@@ -427,14 +482,19 @@ impl Handshake {
             bail!("client DH data too short");
         }
         let hash = plain[0..20].to_vec();
+        // The client hashes the serialized object *including* its constructor
+        // id, so parse through the enum to get the same bytes back.
         let mut cursor = grammers_tl_types::Cursor::from_slice(&plain[20..]);
-        let inner = tl::types::ClientDhInnerData::deserialize(&mut cursor)
+        let inner = tl::enums::ClientDhInnerData::deserialize(&mut cursor)
             .map_err(|e| anyhow!("bad client DH inner data: {}", e))?;
         let cursor_pos = cursor.pos();
         let expected = sha1(&plain[20..20 + cursor_pos]);
         if hash[..] != expected[..] {
             bail!("client DH hash mismatch");
         }
+        let inner = match inner {
+            tl::enums::ClientDhInnerData::Data(v) => v,
+        };
         if inner.nonce != self.nonce || inner.server_nonce != server_nonce {
             bail!("client DH nonce mismatch");
         }
@@ -643,7 +703,11 @@ pub fn rpc_result(req_msg_id: i64, result: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Build an `rpc_error` body.
+/// Build an `rpc_error#2144ca19 error_code:int error_message:string` body.
+///
+/// Note this is *not* a top-level reply: a client correlates errors by the
+/// `req_msg_id` of the enclosing `rpc_result`, so callers must wrap this with
+/// [`rpc_result`].
 pub fn rpc_error(code: i32, message: &str) -> Vec<u8> {
     let mut out = Vec::with_capacity(32 + message.len());
     out.extend_from_slice(&0x2144_ca19u32.to_le_bytes());

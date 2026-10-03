@@ -80,20 +80,36 @@ async fn handle(
                         continue;
                     }
                 };
+                let key_id = auth_key_id(key);
                 let mut ctx = RpcContext {
                     store: store.clone(),
                     cfg: cfg.clone(),
-                    auth_key_id: auth_key_id(key),
-                    user_id: store.session_user(auth_key_id(key))?.unwrap_or(0),
-                    layer: 227,
+                    auth_key_id: key_id,
+                    user_id: store.session_user(key_id)?.unwrap_or(0),
+                    // Default to the schema this server speaks; a client that
+                    // sent `invokeWithLayer` has its real layer persisted.
+                    layer: store.session_layer(key_id)?.unwrap_or(227),
                 };
                 let response = match dispatch(&mut ctx, &env.body) {
                     Ok(result) if result.is_empty() => Vec::new(),
                     Ok(result) => rpc_result(env.msg_id, &result),
-                    Err(e) => match e.downcast_ref::<RpcError>() {
-                        Some(re) => rpc_error(re.code, &re.message),
-                        None => rpc_error(400, "INTERNAL_ERROR"),
-                    },
+                    // Errors ride inside `rpc_result` too: that is where the
+                    // client reads the request id it is waiting on.
+                    Err(e) => {
+                        let body = match e.downcast_ref::<RpcError>() {
+                            Some(re) => rpc_error(re.code, &re.message),
+                            None => {
+                                tracing::warn!(
+                                    "internal error handling {:#010x} from {}: {:#}",
+                                    ctor_of(&env.body),
+                                    peer,
+                                    e
+                                );
+                                rpc_error(400, "INTERNAL_ERROR")
+                            }
+                        };
+                        rpc_result(env.msg_id, &body)
+                    }
                 };
                 if !response.is_empty() {
                     let out_env = EncryptedEnvelope {
@@ -124,14 +140,17 @@ async fn handle(
                     handshake.step1(&rsa)?.to_bytes()
                 }
                 0xd712e4be => {
+                    // Generated `Deserializable` impls read only the fields;
+                    // the constructor id has already been consumed above, so
+                    // the argument buffer must start after it.
                     let f = grammers_tl_types::functions::ReqDhParams::deserialize(
-                        &mut grammers_tl_types::Cursor::from_slice(&body),
+                        &mut grammers_tl_types::Cursor::from_slice(&body[4..]),
                     )?;
                     handshake.step2(&f, &rsa)?.to_bytes()
                 }
                 0xf5045f1f => {
                     let f = grammers_tl_types::functions::SetClientDhParams::deserialize(
-                        &mut grammers_tl_types::Cursor::from_slice(&body),
+                        &mut grammers_tl_types::Cursor::from_slice(&body[4..]),
                     )?;
                     let (answer, key, _salt) = handshake.step3(&f)?;
                     store.save_auth_key(auth_key_id(&key), &key)?;
@@ -157,6 +176,14 @@ async fn handle(
 /// `auth_key_id == 0` marks a plain message, whose declared body length is at
 /// bytes 16..20. Encrypted messages carry `auth_key_id` then a 16-byte message
 /// key, and the AES-IGE payload is always a multiple of 16.
+/// The leading constructor of a TL body, for log messages.
+fn ctor_of(body: &[u8]) -> u32 {
+    if body.len() < 4 {
+        return 0;
+    }
+    u32::from_le_bytes(body[0..4].try_into().unwrap())
+}
+
 fn trim_transport_padding(payload: &mut Vec<u8>) {
     if payload.len() < 4 {
         return;

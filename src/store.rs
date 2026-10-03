@@ -15,6 +15,13 @@ pub fn now() -> i64 {
         .unwrap_or(0)
 }
 
+/// Canonical form of a phone number: digits only, so `+1 555 000 0001` and
+/// `15550000001` resolve to the same account. Both registration and lookup go
+/// through this so the stored value and the queried value always agree.
+pub fn normalize_phone(p: &str) -> String {
+    p.chars().filter(|c| c.is_ascii_digit()).collect()
+}
+
 #[derive(Clone)]
 pub struct Store {
     conn: Arc<Mutex<Connection>>,
@@ -275,6 +282,7 @@ impl Store {
         admin: bool,
     ) -> Result<UserRow> {
         let conn = self.conn();
+        let phone = normalize_phone(phone);
         let id = conn.query_row("SELECT COALESCE(MAX(id), 999999) + 1 FROM users", [], |r| {
             r.get::<_, i64>(0)
         })?;
@@ -312,6 +320,7 @@ impl Store {
     }
 
     pub fn get_user_by_phone(&self, phone: &str) -> Result<Option<UserRow>> {
+        let phone = normalize_phone(phone);
         let conn = self.conn();
         let mut stmt = conn.prepare_cached(
             "SELECT id,access_hash,phone,first_name,last_name,username,about,is_bot,bot_token,
@@ -1063,6 +1072,20 @@ impl Store {
             ],
         )?;
         Ok(())
+    }
+
+    /// Remembers the TL layer a client announced via `invokeWithLayer`, so
+    /// replies can be downgraded to a schema that client can parse. The layer
+    /// is carried by the client, not the request, and every later message is
+    /// dispatched from a fresh context, so it has to be persisted.
+    pub fn set_session_layer(&self, auth_key_id: i64, layer: i32) -> Result<()> {
+        self.set_setting(&format!("layer:{}", auth_key_id), &layer.to_string())
+    }
+
+    pub fn session_layer(&self, auth_key_id: i64) -> Result<Option<i32>> {
+        Ok(self
+            .setting(&format!("layer:{}", auth_key_id))?
+            .and_then(|v| v.parse().ok()))
     }
 
     pub fn session_user(&self, auth_key_id: i64) -> Result<Option<i64>> {

@@ -42,6 +42,7 @@ pub fn dispatch(ctx: &mut RpcContext, body: &[u8]) -> Result<Vec<u8>> {
                 bail!("invokeWithLayer too short");
             }
             ctx.layer = i32::from_le_bytes(body[4..8].try_into().unwrap());
+            ctx.store.set_session_layer(ctx.auth_key_id, ctx.layer)?;
             return dispatch(ctx, &body[8..]);
         }
         0xbf9459b7 => {
@@ -83,7 +84,47 @@ pub fn dispatch(ctx: &mut RpcContext, body: &[u8]) -> Result<Vec<u8>> {
     }
 
     let result = dispatch_inner(ctx, body, ctor);
+    // Third-party clients (Telethon, TDLib-based apps) announce older layers
+    // and cannot parse the few objects whose constructor id changed since.
+    if let Ok(mut reply) = result {
+        restamp_response_for_layer(&mut reply, ctx.layer, ctor);
+        return Ok(reply);
+    }
     result
+}
+
+/// TL methods a client may call before it has an authorized session.
+fn is_pre_auth_method(ctor: u32) -> bool {
+    use grammers_tl_types::functions as f;
+    use grammers_tl_types::Identifiable;
+    matches!(
+        ctor,
+        f::Ping::CONSTRUCTOR_ID
+            | f::PingDelayDisconnect::CONSTRUCTOR_ID
+            | f::DestroySession::CONSTRUCTOR_ID
+            | f::help::GetConfig::CONSTRUCTOR_ID
+            | f::help::GetNearestDc::CONSTRUCTOR_ID
+            | f::help::GetAppConfig::CONSTRUCTOR_ID
+            | f::help::GetAppUpdate::CONSTRUCTOR_ID
+            | f::help::GetSupport::CONSTRUCTOR_ID
+            | f::help::GetTermsOfServiceUpdate::CONSTRUCTOR_ID
+            | f::help::GetCountriesList::CONSTRUCTOR_ID
+            | f::help::GetInviteText::CONSTRUCTOR_ID
+            | f::langpack::GetLanguages::CONSTRUCTOR_ID
+            | f::langpack::GetLanguage::CONSTRUCTOR_ID
+            | f::langpack::GetDifference::CONSTRUCTOR_ID
+            | f::auth::SendCode::CONSTRUCTOR_ID
+            | f::auth::SignIn::CONSTRUCTOR_ID
+            | f::auth::SignUp::CONSTRUCTOR_ID
+            | f::auth::ResendCode::CONSTRUCTOR_ID
+            | f::auth::CancelCode::CONSTRUCTOR_ID
+            | f::auth::LogOut::CONSTRUCTOR_ID
+            | f::auth::ResetAuthorizations::CONSTRUCTOR_ID
+            | f::auth::ExportAuthorization::CONSTRUCTOR_ID
+            | f::auth::ImportAuthorization::CONSTRUCTOR_ID
+            | f::auth::CheckPassword::CONSTRUCTOR_ID
+            | f::auth::RequestPasswordRecovery::CONSTRUCTOR_ID
+    )
 }
 
 fn dispatch_inner(ctx: &mut RpcContext, body: &[u8], ctor: u32) -> Result<Vec<u8>> {
@@ -100,6 +141,13 @@ fn dispatch_inner(ctx: &mut RpcContext, body: &[u8], ctor: u32) -> Result<Vec<u8
     let args = &body[4..];
     let store = &ctx.store;
 
+    // Methods that must work before (or without) a signed-in session. Anything
+    // else is rejected the way the real servers do, so clients trigger their
+    // login flow instead of receiving empty result lists.
+    if ctx.user_id == 0 && !is_pre_auth_method(ctor) {
+        return bail_rpc(401, "AUTH_KEY_UNREGISTERED");
+    }
+
     match ctor {
         // ---------------------------------------------------------------- ping
         0x7abe77ec => {
@@ -108,7 +156,7 @@ fn dispatch_inner(ctx: &mut RpcContext, body: &[u8], ctor: u32) -> Result<Vec<u8
                 msg_id: 0,
                 ping_id: f.ping_id,
             };
-            return Ok(pong.to_bytes());
+            return Ok(tl::enums::Pong::Pong(pong).to_bytes());
         }
 
         // ------------------------------------------------------------- help
@@ -146,7 +194,7 @@ fn dispatch_inner(ctx: &mut RpcContext, body: &[u8], ctor: u32) -> Result<Vec<u8
             let f = tl::functions::users::GetUsers::deserialize(&mut tl::Cursor::from_slice(args))?;
             let mut out = Vec::new();
             for input in &f.id {
-                if let Some(u) = resolve_input_user(store, input)? {
+                if let Some(u) = resolve_input_user(store, input, ctx.user_id)? {
                     out.push(build_user(ctx, &u)?);
                 }
             }
@@ -176,27 +224,25 @@ fn dispatch_inner(ctx: &mut RpcContext, body: &[u8], ctor: u32) -> Result<Vec<u8
         // ---------------------------------------------------------- messages
         0xa0f4cb4f => {
             let f = tl::functions::messages::GetDialogs::deserialize(&mut tl::Cursor::from_slice(
-                body,
+                args,
             ))?;
             return handle_get_dialogs(ctx, &f);
         }
         0x4423e6c5 => {
             let f = tl::functions::messages::GetHistory::deserialize(&mut tl::Cursor::from_slice(
-                body,
+                args,
             ))?;
             return handle_get_history(ctx, &f);
         }
-        0xfef48f62 => {
-            let f = tl::functions::messages::SendMessage::deserialize(
-                &mut tl::Cursor::from_slice(args),
-            )?;
-            return handle_send_message(ctx, &f);
+        0xfef48f62 | 0x545cd15a => {
+            // `messages.sendMessage`: `#fef48f62` at the current layer,
+            // `#545cd15a` from layer <= 224 clients such as Telethon.
+            return handle_send_message(ctx, &parse_send_message(args)?);
         }
-        0xb106e66c => {
-            let f = tl::functions::messages::EditMessage::deserialize(
-                &mut tl::Cursor::from_slice(args),
-            )?;
-            return handle_edit_message(ctx, &f);
+        0xb106e66c | 0x51e842e1 => {
+            // `messages.editMessage`: `#b106e66c` at the current layer,
+            // `#51e842e1` from layer <= 224 clients such as Telethon.
+            return handle_edit_message(ctx, &parse_edit_message(args)?);
         }
         0xe58e95d2 => {
             let f = tl::functions::messages::DeleteMessages::deserialize(
@@ -249,10 +295,20 @@ fn dispatch_inner(ctx: &mut RpcContext, body: &[u8], ctor: u32) -> Result<Vec<u8
             )?;
             return handle_resolve_username(ctx, &f);
         }
-        0x5f58d0f => {
+        0x11f812d8 => {
+            // Legacy `contacts.search#11f812d8 q:string limit:int`, still sent
+            // by clients pinned to older layers (e.g. Telethon).
+            let mut cur = tl::Cursor::from_slice(args);
+            let q = String::deserialize(&mut cur)?;
+            let limit = i32::deserialize(&mut cur)?;
+            return handle_contacts_search_query(ctx, &q, limit);
+        }
+        0x05f58d0f => {
+            // `contacts.search#05f58d0f flags:# q:string limit:int` (current
+            // layer, with `broadcasts`/`bots` flags).
             let f =
                 tl::functions::contacts::Search::deserialize(&mut tl::Cursor::from_slice(args))?;
-            return handle_contacts_search(ctx, &f);
+            return handle_contacts_search_query(ctx, &f.q, f.limit);
         }
         0xe40ca104 => {
             let f = tl::functions::messages::GetCommonChats::deserialize(
@@ -320,11 +376,11 @@ fn dispatch_inner(ctx: &mut RpcContext, body: &[u8], ctor: u32) -> Result<Vec<u8
         0x92ceddd4 => {
             // messages.createChat
             let f = tl::functions::messages::CreateChat::deserialize(&mut tl::Cursor::from_slice(
-                body,
+                args,
             ))?;
             let chat = store.create_chat(&f.title, ctx.user_id)?;
             for input in &f.users {
-                if let Some(u) = resolve_input_user(store, input)? {
+                if let Some(u) = resolve_input_user(store, input, ctx.user_id)? {
                     store.add_chat_member(chat.id, u.id, "member")?;
                 }
             }
@@ -375,7 +431,7 @@ fn dispatch_inner(ctx: &mut RpcContext, body: &[u8], ctor: u32) -> Result<Vec<u8
         // ------------------------------------------------------------- upload
         0xb304a621 => {
             let f = tl::functions::upload::SaveFilePart::deserialize(&mut tl::Cursor::from_slice(
-                body,
+                args,
             ))?;
             store.put_file_part(f.file_id, f.file_part, &f.bytes)?;
             return Ok(true.to_bytes());
@@ -434,7 +490,7 @@ fn dispatch_inner(ctx: &mut RpcContext, body: &[u8], ctor: u32) -> Result<Vec<u8
                 version: f.from_version,
                 strings: Vec::new(),
             };
-            return Ok(diff.to_bytes());
+            return Ok(tl::enums::LangPackDifference::Difference(diff).to_bytes());
         }
         0x6a596502 => {
             let _f = tl::functions::langpack::GetLanguage::deserialize(
@@ -470,7 +526,7 @@ fn resolve_user_any(ctx: &RpcContext, i: &tl::enums::InputUser) -> Result<Option
     use tl::enums::InputUser as U;
     match i {
         U::UserSelf => ctx.store.get_user(ctx.user_id),
-        other => resolve_input_user(&ctx.store, other),
+        other => resolve_input_user(&ctx.store, other, ctx.user_id),
     }
 }
 
@@ -818,12 +874,9 @@ fn handle_resolve_username(
 }
 
 /// `contacts.search` — search users and chats by name or username.
-fn handle_contacts_search(
-    ctx: &RpcContext,
-    f: &tl::functions::contacts::Search,
-) -> Result<Vec<u8>> {
-    let q = f.q.to_lowercase();
-    let limit = f.limit.clamp(1, 100) as usize;
+fn handle_contacts_search_query(ctx: &RpcContext, query: &str, limit: i32) -> Result<Vec<u8>> {
+    let q = query.to_lowercase();
+    let limit = limit.clamp(1, 100) as usize;
     let mut users = Vec::new();
     let mut results = Vec::new();
     if !q.is_empty() {
@@ -1453,10 +1506,7 @@ fn handle_get_history(
     Ok(tl::enums::messages::Messages::Messages(resp).to_bytes())
 }
 
-fn handle_send_message(
-    ctx: &mut RpcContext,
-    f: &tl::functions::messages::SendMessage,
-) -> Result<Vec<u8>> {
+fn handle_send_message(ctx: &mut RpcContext, f: &SendMessageArgs) -> Result<Vec<u8>> {
     let (kind, id) = resolve_peer(&f.peer)?;
     let sender = if kind == "user" && id == ctx.user_id {
         ctx.user_id
@@ -1504,10 +1554,7 @@ fn handle_send_message(
     Ok(tl::enums::Updates::UpdateShortSentMessage(resp).to_bytes())
 }
 
-fn handle_edit_message(
-    ctx: &mut RpcContext,
-    f: &tl::functions::messages::EditMessage,
-) -> Result<Vec<u8>> {
+fn handle_edit_message(ctx: &mut RpcContext, f: &EditMessageArgs) -> Result<Vec<u8>> {
     let (kind, id) = resolve_peer(&f.peer)?;
     let text = f.message.clone().unwrap_or_default();
     if !ctx.store.edit_message(&kind, id, f.id, &text)? {
@@ -1593,7 +1640,7 @@ fn bump_pts(ctx: &RpcContext, user: i64) -> Result<(i32, i32)> {
 
 // -------------------------------------------------------- TL construction
 
-pub fn build_config(ctx: &RpcContext) -> Result<tl::types::Config> {
+pub fn build_config(ctx: &RpcContext) -> Result<tl::enums::Config> {
     let ip = ctx
         .cfg
         .public_ip(std::net::SocketAddr::from(([0, 0, 0, 0], 0)));
@@ -1629,7 +1676,7 @@ pub fn build_config(ctx: &RpcContext) -> Result<tl::types::Config> {
         }));
     }
     let now_ts = now() as i32;
-    Ok(tl::types::Config {
+    Ok(tl::enums::Config::Config(tl::types::Config {
         default_p2p_contacts: false,
         preload_featured_stickers: false,
         revoke_pm_inbox: true,
@@ -1677,7 +1724,7 @@ pub fn build_config(ctx: &RpcContext) -> Result<tl::types::Config> {
         base_lang_pack_version: None,
         reactions_default: None,
         autologin_token: None,
-    })
+    }))
 }
 
 pub fn build_user(ctx: &RpcContext, u: &UserRow) -> Result<tl::enums::User> {
@@ -1790,6 +1837,121 @@ fn default_notify() -> tl::enums::PeerNotifySettings {
     })
 }
 
+/// TL `Message` and `auth.Authorization` are the only two objects whose
+/// constructor id changed between layer 224 (Telethon and most third-party
+/// clients) and layer 227 (the schema this server is generated from). Their
+/// field layouts are byte-identical, so a reply can be re-stamped for whichever
+/// layer the client announced.
+pub const LAYER_227: i32 = 227;
+const MESSAGE_CTOR_224: u32 = 0x3ae56482;
+const MESSAGE_CTOR_227: u32 = 0x7600b9d3;
+const AUTH_AUTHORIZATION_CTOR_224: u32 = 0x2ea2c0d4;
+const AUTH_AUTHORIZATION_CTOR_227: u32 = 0xad01d61d;
+
+/// Rewrites a single object's leading constructor id when the client speaks an
+/// older layer than the schema this server serializes with.
+fn restamp_ctor(body: &mut [u8], layer: i32, current: u32, legacy: u32) {
+    if layer >= LAYER_227 || body.len() < 4 {
+        return;
+    }
+    if u32::from_le_bytes(body[0..4].try_into().unwrap()) == current {
+        body[0..4].copy_from_slice(&legacy.to_le_bytes());
+    }
+}
+
+/// Re-stamps every `Message` inside a `vector<Message>` in a response body.
+///
+/// Responses nest their message vector at a different offset depending on the
+/// envelope (`messages.messages`, `messages.dialogs`, `messages.peerDialogs`,
+/// `messages.messagesSlice`, ...), so rather than hard-code each one this walks
+/// the body looking for a vector whose every element parses as a `Message`.
+/// Requiring a clean parse of all elements keeps `vector<Chat>`/`vector<User>`
+/// from being mistaken for it.
+fn restamp_message_list(body: &mut [u8], layer: i32) {
+    if layer >= LAYER_227 || body.len() < 12 {
+        return;
+    }
+    let needle = 0x1cb5c415u32.to_le_bytes();
+    for i in 0..body.len().saturating_sub(8) {
+        if body[i..i + 4] != needle {
+            continue;
+        }
+        let count = i32::from_le_bytes(body[i + 4..i + 8].try_into().unwrap());
+        if count <= 0 || count > 100_000 {
+            continue;
+        }
+        let mut cursor = tl::Cursor::from_slice(&body[i + 8..]);
+        let mut offsets = Vec::with_capacity(count as usize);
+        let mut all_ok = true;
+        for _ in 0..count {
+            let start = cursor.pos();
+            // The generated `Deserializable` impl for the bare struct reads
+            // only the fields; the enum consumes the constructor as well.
+            if tl::enums::Message::deserialize(&mut cursor).is_err() {
+                all_ok = false;
+                break;
+            }
+            offsets.push(i + 8 + start);
+        }
+        if !all_ok {
+            continue;
+        }
+
+        // Only rewrite when the vector really held layer-227 messages.
+        if !offsets.iter().any(|off| {
+            off + 4 <= body.len()
+                && u32::from_le_bytes(body[*off..*off + 4].try_into().unwrap()) == MESSAGE_CTOR_227
+        }) {
+            continue;
+        }
+        for off in offsets {
+            if off + 4 <= body.len()
+                && u32::from_le_bytes(body[off..off + 4].try_into().unwrap()) == MESSAGE_CTOR_227
+            {
+                body[off..off + 4].copy_from_slice(&MESSAGE_CTOR_224.to_le_bytes());
+            }
+        }
+        return;
+    }
+}
+
+/// Re-stamps an `auth.Authorization` reply for older-layer clients.
+fn restamp_authorization(body: &mut [u8], layer: i32) {
+    restamp_ctor(
+        body,
+        layer,
+        AUTH_AUTHORIZATION_CTOR_227,
+        AUTH_AUTHORIZATION_CTOR_224,
+    );
+}
+
+/// Downgrades the constructor ids in a reply to the layer the client announced.
+pub fn restamp_response_for_layer(body: &mut [u8], layer: i32, ctor: u32) {
+    if layer >= LAYER_227 {
+        return;
+    }
+    match ctor {
+        // auth.signIn / auth.signUp / auth.importAuthorization
+        0x8d52a951 | 0xaac7b717 | 0xa57a7dad => restamp_authorization(body, layer),
+        // Every reply that can carry `Message` objects.
+        0xa0f4cb4f // messages.getDialogs
+        | 0x4423e6c5 // messages.getHistory
+        | 0x63c66506 // messages.getMessages
+        | 0xe470bcfd // messages.getPeerDialogs
+        | 0x29ee847a // messages.search
+        | 0xe40ca104 // messages.getCommonChats
+        | 0x49e9528f // messages.getChats
+        | 0xfef48f62 // messages.sendMessage
+        | 0x545cd15a // messages.sendMessage (layer <= 224)
+        | 0xb106e66c // messages.editMessage
+        | 0x51e842e1 // messages.editMessage (layer <= 224)
+        | 0x0e306d3a // messages.readHistory
+        | 0x19c2f763 // updates.getDifference
+        | 0xedd4882a => restamp_message_list(body, layer),
+        _ => {}
+    }
+}
+
 fn build_message(m: &MessageRow, peer: tl::enums::Peer) -> tl::enums::Message {
     let from = if let Some(sid) = m.sender_chat_id {
         tl::enums::Peer::Chat(tl::types::PeerChat { chat_id: sid })
@@ -1854,11 +2016,7 @@ fn build_message(m: &MessageRow, peer: tl::enums::Peer) -> tl::enums::Message {
 
 // ------------------------------------------------------------- utilities
 
-fn normalize_phone(p: &str) -> String {
-    p.chars()
-        .filter(|c| c.is_ascii_digit() || *c == '+')
-        .collect()
-}
+use crate::store::normalize_phone;
 
 fn hash_for(s: &str) -> String {
     let h = crate::crypto::sha1(s.as_bytes());
@@ -1923,6 +2081,104 @@ fn skip_value(buf: &[u8], off: &mut usize) -> Result<()> {
     }
 }
 
+/// Reads the `flags:#` word that TL uses to gate optional fields.
+fn read_flags(buf: &[u8], off: &mut usize) -> Result<u32> {
+    Ok(read_i32(buf, off)? as u32)
+}
+
+/// Fields the server needs from a `messages.sendMessage` request, whichever
+/// layer the client speaks. The leading fields are identical across layers, so
+/// the trailing optionals are simply walked past.
+struct SendMessageArgs {
+    peer: tl::enums::InputPeer,
+    message: String,
+    random_id: i64,
+}
+
+/// `messages.sendMessage#545cd15a` (layer <= 224, as sent by Telethon) and the
+/// current `#fef48f62`: same leading layout, extra trailing optionals.
+fn parse_send_message(args: &[u8]) -> Result<SendMessageArgs> {
+    let mut cur = tl::Cursor::from_slice(args);
+    let flags = u32::deserialize(&mut cur)?;
+    let peer = tl::enums::InputPeer::deserialize(&mut cur)?;
+    if flags & 1 != 0 {
+        let _reply_to = tl::enums::InputReplyTo::deserialize(&mut cur)?;
+    }
+    let message = String::deserialize(&mut cur)?;
+    let random_id = i64::deserialize(&mut cur)?;
+    if flags & 4 != 0 {
+        let _reply_markup = tl::enums::ReplyMarkup::deserialize(&mut cur)?;
+    }
+    if flags & 8 != 0 {
+        let _entities = Vec::<tl::enums::MessageEntity>::deserialize(&mut cur)?;
+    }
+    if flags & 1024 != 0 {
+        let _schedule_date = i32::deserialize(&mut cur)?;
+    }
+    if flags & 16777216 != 0 {
+        let _schedule_repeat_period = i32::deserialize(&mut cur)?;
+    }
+    if flags & 8192 != 0 {
+        let _send_as = tl::enums::InputPeer::deserialize(&mut cur)?;
+    }
+    if flags & 131072 != 0 {
+        let _quick_reply_shortcut = tl::enums::InputQuickReplyShortcut::deserialize(&mut cur)?;
+    }
+    if flags & 262144 != 0 {
+        let _effect = i64::deserialize(&mut cur)?;
+    }
+    if flags & 2097152 != 0 {
+        let _allow_paid_stars = i64::deserialize(&mut cur)?;
+    }
+    if flags & 4194304 != 0 {
+        let _suggested_post = tl::enums::SuggestedPost::deserialize(&mut cur)?;
+    }
+    Ok(SendMessageArgs {
+        peer,
+        message,
+        random_id,
+    })
+}
+
+/// Fields the server needs from a `messages.editMessage` request.
+struct EditMessageArgs {
+    peer: tl::enums::InputPeer,
+    id: i32,
+    message: Option<String>,
+}
+
+/// `messages.editMessage#51e842e1` (layer <= 224) and the current `#b106e66c`.
+fn parse_edit_message(args: &[u8]) -> Result<EditMessageArgs> {
+    let mut cur = tl::Cursor::from_slice(args);
+    let flags = u32::deserialize(&mut cur)?;
+    let peer = tl::enums::InputPeer::deserialize(&mut cur)?;
+    let id = i32::deserialize(&mut cur)?;
+    let message = if flags & 2048 != 0 {
+        Some(String::deserialize(&mut cur)?)
+    } else {
+        None
+    };
+    if flags & 16384 != 0 {
+        let _media = tl::enums::InputMedia::deserialize(&mut cur)?;
+    }
+    if flags & 4 != 0 {
+        let _reply_markup = tl::enums::ReplyMarkup::deserialize(&mut cur)?;
+    }
+    if flags & 8 != 0 {
+        let _entities = Vec::<tl::enums::MessageEntity>::deserialize(&mut cur)?;
+    }
+    if flags & 32768 != 0 {
+        let _schedule_date = i32::deserialize(&mut cur)?;
+    }
+    if flags & 262144 != 0 {
+        let _schedule_repeat_period = i32::deserialize(&mut cur)?;
+    }
+    if flags & 131072 != 0 {
+        let _quick_reply_shortcut_id = i32::deserialize(&mut cur)?;
+    }
+    Ok(EditMessageArgs { peer, id, message })
+}
+
 fn resolve_peer(input: &tl::enums::InputPeer) -> Result<(String, i64)> {
     use tl::enums::InputPeer as P;
     match input {
@@ -1936,14 +2192,22 @@ fn resolve_peer(input: &tl::enums::InputPeer) -> Result<(String, i64)> {
     }
 }
 
-fn resolve_input_user(store: &Store, i: &tl::enums::InputUser) -> Result<Option<UserRow>> {
+fn resolve_input_user(
+    store: &Store,
+    i: &tl::enums::InputUser,
+    self_id: i64,
+) -> Result<Option<UserRow>> {
     use tl::enums::InputUser as U;
     let id = match i {
         U::User(u) => u.user_id,
         U::FromMessage(u) => u.user_id,
-        U::UserSelf => return store.all_users().map(|mut users| users.pop()),
+        // `inputUserSelf` means *the caller*, not "any user in the database".
+        U::UserSelf => self_id,
         U::Empty => return Ok(None),
     };
+    if id == 0 {
+        return Ok(None);
+    }
     store.get_user(id)
 }
 
@@ -1960,15 +2224,15 @@ fn dialog_peer(kind: &str, id: i64) -> tl::enums::Peer {
 }
 
 fn peer_of_dialog(kind: &str, id: i64, self_id: i64) -> tl::enums::Peer {
-    if kind == "user" {
-        if id == self_id {
-            tl::enums::Peer::User(tl::types::PeerUser { user_id: self_id })
-        } else {
-            dialog_peer(kind, id)
-        }
-    } else {
-        dialog_peer(kind, id)
+    // `inputPeerSelf` resolves to `("self", 0)`, and a dialog with yourself is
+    // addressed as your own user id.
+    if kind == "self" {
+        return tl::enums::Peer::User(tl::types::PeerUser { user_id: self_id });
     }
+    if kind == "user" && id == self_id {
+        return tl::enums::Peer::User(tl::types::PeerUser { user_id: self_id });
+    }
+    dialog_peer(kind, id)
 }
 
 fn self_peer(m: &MessageRow, self_id: i64) -> tl::enums::Peer {

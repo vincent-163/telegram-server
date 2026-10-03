@@ -114,20 +114,27 @@ fn process_encrypted(state: &AppState, payload: &[u8]) -> Result<Vec<u8>> {
         return Ok((-404i32).to_le_bytes().to_vec());
     };
     let envelope = EncryptedEnvelope::decode(payload, &key)?;
+    let key_id = auth_key_id(&key);
     let mut ctx = RpcContext {
         store: state.store.clone(),
         cfg: state.cfg.clone(),
-        auth_key_id: auth_key_id(&key),
-        user_id: state.store.session_user(auth_key_id(&key))?.unwrap_or(0),
-        layer: 227,
+        auth_key_id: key_id,
+        user_id: state.store.session_user(key_id)?.unwrap_or(0),
+        layer: state.store.session_layer(key_id)?.unwrap_or(227),
     };
     let response_body = match dispatch(&mut ctx, &envelope.body) {
         Ok(result) if result.is_empty() => return Ok(Vec::new()),
         Ok(result) => rpc_result(envelope.msg_id, &result),
-        Err(error) => match error.downcast_ref::<RpcError>() {
-            Some(rpc) => rpc_error(rpc.code, &rpc.message),
-            None => rpc_error(400, "INTERNAL_ERROR"),
-        },
+        Err(error) => {
+            let body = match error.downcast_ref::<RpcError>() {
+                Some(rpc) => rpc_error(rpc.code, &rpc.message),
+                None => {
+                    tracing::warn!("internal error handling HTTP MTProto request: {:#}", error);
+                    rpc_error(400, "INTERNAL_ERROR")
+                }
+            };
+            rpc_result(envelope.msg_id, &body)
+        }
     };
     let response = EncryptedEnvelope {
         salt: envelope.salt,

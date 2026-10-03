@@ -4,7 +4,8 @@ use num_bigint::{BigUint, RandBigInt};
 use num_traits::One;
 use rand::RngCore;
 use telegram_server::crypto::{
-    dh_aes_key_iv, factorize_pq, ige_encrypt, rsa_encrypt_hashed, sha1, RsaPublicKey,
+    dh_aes_key_iv, factorize_pq, ige_encrypt, rsa_encrypt_hashed, rsa_encrypt_legacy, sha1,
+    RsaPublicKey,
 };
 use telegram_server::mtproto::{Handshake, RsaKeyPair};
 
@@ -78,8 +79,11 @@ fn complete_authorization_handshake() {
     assert_eq!(public_key.fingerprint(), key.fingerprint());
     let mut random = [0u8; 224];
     rand::thread_rng().fill_bytes(&mut random);
-    let encrypted_pq_inner =
-        rsa_encrypt_hashed(&pq_inner.to_bytes(), &public_key, &random).unwrap();
+    // The real clients (Telethon, TDLib, official apps) use the legacy
+    // `sha1(data) || data || padding` scheme, and serialize the object *with*
+    // its constructor id; exercise that path here.
+    let pq_inner_bytes = tl::enums::PQInnerData::Data(pq_inner.clone()).to_bytes();
+    let encrypted_pq_inner = rsa_encrypt_legacy(&pq_inner_bytes, &public_key, &random).unwrap();
 
     let req_dh = tl::functions::ReqDhParams {
         nonce: res_pq.nonce,
@@ -102,8 +106,13 @@ fn complete_authorization_handshake() {
     let (key2, iv2) = dh_aes_key_iv(&server_dh.server_nonce, &new_nonce);
     let mut answer = server_dh.encrypted_answer.clone();
     telegram_server::crypto::ige_decrypt(&mut answer, &key2, &iv2);
+    // The server emits the inner data *with* its constructor id, and the hash
+    // covers those bytes too, so parse through the enum.
     let mut answer_cursor = tl::Cursor::from_slice(&answer[20..]);
-    let server_inner = tl::types::ServerDhInnerData::deserialize(&mut answer_cursor).unwrap();
+    let server_inner = match tl::enums::ServerDhInnerData::deserialize(&mut answer_cursor).unwrap()
+    {
+        tl::enums::ServerDhInnerData::Data(v) => v,
+    };
     let answer_len = 20 + answer_cursor.pos();
     assert_eq!(answer[..20], sha1(&answer[20..answer_len]));
     assert_eq!(server_inner.nonce, res_pq.nonce);
@@ -126,7 +135,8 @@ fn complete_authorization_handshake() {
         retry_id: 0,
         g_b: client_public.to_bytes_be(),
     };
-    let client_inner = client_inner.to_bytes();
+    // Real clients hash the object including its constructor id.
+    let client_inner = tl::enums::ClientDhInnerData::Data(client_inner).to_bytes();
     let mut client_answer = Vec::with_capacity(client_inner.len() + 32);
     client_answer.extend_from_slice(&sha1(&client_inner));
     client_answer.extend_from_slice(&client_inner);

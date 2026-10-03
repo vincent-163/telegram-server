@@ -50,7 +50,9 @@ fn setup() -> Fixture {
         cfg,
         auth_key_id: 42,
         user_id: self_user.id,
-        layer: 181,
+        // The schema this server serializes with. Tests that exercise the
+        // layer-downgrade path set a lower value explicitly.
+        layer: 227,
     };
     Fixture { ctx, _dir: dir }
 }
@@ -545,4 +547,250 @@ fn account_update_profile_writes_through() {
     let me = fx.ctx.store.get_user(fx.ctx.user_id).unwrap().unwrap();
     assert_eq!(me.first_name, "Renamed");
     assert_eq!(me.about, "bio");
+}
+
+// ---------------------------------------------------------------------------
+// Regression tests for the wire-level defects found while driving a real client
+// (Telethon, layer 224) against the server. Each of these failed before.
+// ---------------------------------------------------------------------------
+
+/// Every reply that carries messages must come back stamped with the
+/// constructor id of the layer the client announced. `Message` is one of only
+/// two objects whose id changed between layer 224 and 227.
+#[test]
+fn message_replies_are_downgraded_for_older_layers() {
+    let mut fx = setup();
+    fx.ctx.layer = 224;
+    let _: tl::enums::Updates = call(
+        &mut fx.ctx,
+        &tl::functions::messages::SendMessage {
+            no_webpage: false,
+            silent: false,
+            background: false,
+            clear_draft: false,
+            noforwards: false,
+            update_stickersets_order: false,
+            invert_media: false,
+            allow_paid_floodskip: false,
+            peer: tl::enums::InputPeer::PeerSelf,
+            reply_to: None,
+            message: "hello".into(),
+            random_id: 1,
+            reply_markup: None,
+            entities: None,
+            schedule_date: None,
+            schedule_repeat_period: None,
+            send_as: None,
+            quick_reply_shortcut: None,
+            effect: None,
+            allow_paid_stars: None,
+            suggested_post: None,
+            rich_message: None,
+        },
+    );
+
+    let body = dispatch(
+        &mut fx.ctx,
+        &tl::functions::messages::GetHistory {
+            peer: tl::enums::InputPeer::PeerSelf,
+            offset_id: 0,
+            offset_date: 0,
+            add_offset: 0,
+            limit: 10,
+            max_id: 0,
+            min_id: 0,
+            hash: 0,
+        }
+        .to_bytes(),
+    )
+    .unwrap();
+
+    // The reply must not contain a layer-227 `message#7600b9d3` any more.
+    let needle = 0x7600b9d3u32.to_le_bytes();
+    assert!(
+        !body.windows(4).any(|w| w == needle),
+        "reply still carries layer-227 Message constructors"
+    );
+    let legacy = 0x3ae56482u32.to_le_bytes();
+    assert!(
+        body.windows(4).any(|w| w == legacy),
+        "reply does not carry layer-224 Message constructors"
+    );
+    // The envelope must still be a valid `messages.messages` holding exactly
+    // one message. grammers is generated from layer 227, so the downgraded id
+    // cannot be parsed directly; restore it and parse, which proves the only
+    // change was the constructor id.
+    let legacy = 0x3ae56482u32.to_le_bytes();
+    let mut restored = body.clone();
+    let mut i = 0;
+    while i + 4 <= restored.len() {
+        if restored[i..i + 4] == legacy {
+            restored[i..i + 4].copy_from_slice(&0x7600b9d3u32.to_le_bytes());
+        }
+        i += 1;
+    }
+    let parsed = tl::enums::messages::Messages::deserialize(&mut tl::Cursor::from_slice(&restored))
+        .expect("reply must be a messages.Messages once the id is restored");
+    let msgs = match parsed {
+        tl::enums::messages::Messages::Messages(m) => m.messages,
+        other => panic!("unexpected reply {other:?}"),
+    };
+    assert_eq!(msgs.len(), 1);
+}
+
+/// The peer of a self-dialog must be the acting user, not user 0.
+#[test]
+fn self_dialog_messages_use_the_real_peer() {
+    let mut fx = setup();
+    let self_id = fx.ctx.user_id;
+    let _: tl::enums::Updates = call(
+        &mut fx.ctx,
+        &tl::functions::messages::SendMessage {
+            no_webpage: false,
+            silent: false,
+            background: false,
+            clear_draft: false,
+            noforwards: false,
+            update_stickersets_order: false,
+            invert_media: false,
+            allow_paid_floodskip: false,
+            peer: tl::enums::InputPeer::PeerSelf,
+            reply_to: None,
+            message: "note to self".into(),
+            random_id: 2,
+            reply_markup: None,
+            entities: None,
+            schedule_date: None,
+            schedule_repeat_period: None,
+            send_as: None,
+            quick_reply_shortcut: None,
+            effect: None,
+            allow_paid_stars: None,
+            suggested_post: None,
+            rich_message: None,
+        },
+    );
+    let hist: tl::enums::messages::Messages = call(
+        &mut fx.ctx,
+        &tl::functions::messages::GetHistory {
+            peer: tl::enums::InputPeer::PeerSelf,
+            offset_id: 0,
+            offset_date: 0,
+            add_offset: 0,
+            limit: 10,
+            max_id: 0,
+            min_id: 0,
+            hash: 0,
+        },
+    );
+    let msgs = match hist {
+        tl::enums::messages::Messages::Messages(m) => m.messages,
+        other => panic!("unexpected reply {other:?}"),
+    };
+    let msg = match &msgs[0] {
+        tl::enums::Message::Message(m) => m,
+        other => panic!("unexpected message {other:?}"),
+    };
+    match &msg.peer_id {
+        tl::enums::Peer::User(u) => assert_eq!(u.user_id, self_id),
+        other => panic!("expected PeerUser({self_id}), got {other:?}"),
+    }
+}
+
+/// A layer-224 `messages.sendMessage#545cd15a` body must be accepted, even
+/// though this server is generated from layer 227.
+#[test]
+fn legacy_layer_send_message_body_is_accepted() {
+    let mut fx = setup();
+    // Hand-serialize `messages.sendMessage#545cd15a flags:# peer:InputPeer
+    // message:string random_id:long` with no optional fields set.
+    let mut body = Vec::new();
+    body.extend_from_slice(&0x545cd15au32.to_le_bytes());
+    body.extend_from_slice(&0u32.to_le_bytes()); // flags
+    body.extend_from_slice(&tl::enums::InputPeer::PeerSelf.to_bytes());
+    let text = b"legacy layer message";
+    body.push(text.len() as u8);
+    body.extend_from_slice(text);
+    while body.len() % 4 != 0 {
+        body.push(0);
+    }
+    body.extend_from_slice(&7i64.to_le_bytes()); // random_id
+
+    let reply = dispatch(&mut fx.ctx, &body).expect("legacy sendMessage must be accepted");
+    let parsed = tl::enums::Updates::deserialize(&mut tl::Cursor::from_slice(&reply))
+        .expect("legacy sendMessage reply must parse");
+    match parsed {
+        tl::enums::Updates::UpdateShortSentMessage(_) => {}
+        other => panic!("unexpected reply {other:?}"),
+    }
+}
+
+/// Unauthenticated calls must be rejected with 401 rather than returning empty
+/// result lists, which would leave clients stuck in their init sequence.
+#[test]
+fn unauthenticated_calls_are_rejected() {
+    let mut fx = setup();
+    fx.ctx.user_id = 0;
+    let err = dispatch(
+        &mut fx.ctx,
+        &tl::functions::messages::GetDialogs {
+            exclude_pinned: false,
+            folder_id: None,
+            offset_date: 0,
+            offset_id: 0,
+            offset_peer: tl::enums::InputPeer::Empty,
+            limit: 10,
+            hash: 0,
+        }
+        .to_bytes(),
+    )
+    .expect_err("unauthenticated getDialogs must fail");
+    let rpc = telegram_server::rpc::as_rpc_error(&err).expect("expected an rpc_error");
+    assert_eq!(rpc.code, 401);
+}
+
+/// `contacts.search` changed shape between layers; both encodings must work.
+#[test]
+fn both_contacts_search_encodings_are_accepted() {
+    let mut fx = setup();
+    // Current layer: flags:# q:string limit:int.
+    let mut current = Vec::new();
+    current.extend_from_slice(&0x05f58d0fu32.to_le_bytes());
+    current.extend_from_slice(&0u32.to_le_bytes());
+    let q = b"admin";
+    current.push(q.len() as u8);
+    current.extend_from_slice(q);
+    while current.len() % 4 != 0 {
+        current.push(0);
+    }
+    current.extend_from_slice(&10i32.to_le_bytes());
+    let reply = dispatch(&mut fx.ctx, &current).expect("current contacts.search must be accepted");
+    let _: tl::enums::contacts::Found =
+        tl::enums::contacts::Found::deserialize(&mut tl::Cursor::from_slice(&reply)).unwrap();
+
+    // Legacy layer: q:string limit:int.
+    let mut legacy = Vec::new();
+    legacy.extend_from_slice(&0x11f812d8u32.to_le_bytes());
+    legacy.push(q.len() as u8);
+    legacy.extend_from_slice(q);
+    while legacy.len() % 4 != 0 {
+        legacy.push(0);
+    }
+    legacy.extend_from_slice(&10i32.to_le_bytes());
+    let reply = dispatch(&mut fx.ctx, &legacy).expect("legacy contacts.search must be accepted");
+    let found =
+        tl::enums::contacts::Found::deserialize(&mut tl::Cursor::from_slice(&reply)).unwrap();
+    match found {
+        tl::enums::contacts::Found::Found(f) => assert!(!f.results.is_empty()),
+    }
+}
+
+/// `+1 555 000 0001` and `15550000001` must resolve to the same account.
+#[test]
+fn phone_numbers_are_normalized() {
+    let fx = setup();
+    let with_plus = fx.ctx.store.get_user_by_phone("+1 555 000 0001").unwrap();
+    let plain = fx.ctx.store.get_user_by_phone("15550000001").unwrap();
+    assert!(with_plus.is_some(), "normalized lookup failed");
+    assert_eq!(with_plus.unwrap().id, plain.unwrap().id);
 }
