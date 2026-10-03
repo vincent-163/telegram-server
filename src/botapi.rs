@@ -49,10 +49,16 @@ impl Params {
         self.get(key).and_then(|v| v.as_str()).map(str::to_owned)
     }
     fn i64(&self, key: &str) -> Option<i64> {
-        self.get(key).and_then(|v| v.as_i64())
+        match self.get(key)? {
+            Value::Number(n) => n.as_i64(),
+            // Form-encoded and query-string parameters always arrive as
+            // strings, so parse them too rather than requiring JSON.
+            Value::String(s) => s.trim().parse().ok(),
+            _ => None,
+        }
     }
     fn i32(&self, key: &str) -> Option<i32> {
-        self.get(key).and_then(|v| v.as_i64()).map(|v| v as i32)
+        self.i64(key).map(|v| v as i32)
     }
 }
 
@@ -162,14 +168,14 @@ async fn handle_bot(
             .collect(),
     };
     match method {
-        "getMe" => Ok(user_json(&bot)),
+        "getMe" => Ok(ok_result(user_json(&bot))),
         "sendMessage" => {
             let chat_id = p
                 .i64("chat_id")
                 .ok_or_else(|| anyhow!("chat_id required"))?;
             let text = p.str("text").unwrap_or_default();
             let msg_id = send_message(state, &bot, chat_id, &text, "text", None)?;
-            Ok(json!({"ok": true, "result": message_json(&bot, chat_id, msg_id, &text)}))
+            Ok(ok_result(message_json(&bot, chat_id, msg_id, &text)))
         }
         "sendPhoto" | "sendDocument" => {
             let chat_id = p
@@ -186,7 +192,7 @@ async fn handle_bot(
                 "document"
             };
             let msg_id = send_message(state, &bot, chat_id, &caption, media, Some(&file_id))?;
-            Ok(json!({"ok": true, "result": message_json(&bot, chat_id, msg_id, &caption)}))
+            Ok(ok_result(message_json(&bot, chat_id, msg_id, &caption)))
         }
         "getUpdates" => {
             let offset = p.i64("offset").unwrap_or(0);
@@ -205,20 +211,28 @@ async fn handle_bot(
             if !ids.is_empty() {
                 state.store.mark_bot_updates_consumed(&ids)?;
             }
-            Ok(json!({"ok": true, "result": out}))
+            Ok(ok_result(Value::Array(out)))
         }
         "deleteWebhook" | "setWebhook" | "deleteMyCommands" | "setMyCommands" => {
-            Ok(json!({"ok": true, "result": true}))
+            Ok(ok_result(json!(true)))
         }
         "getChat" => {
             let chat_id = p
                 .i64("chat_id")
                 .ok_or_else(|| anyhow!("chat_id required"))?;
-            Ok(json!({"ok": true, "result": {"id": chat_id, "type": "private", "title": ""}}))
+            Ok(ok_result(
+                json!({"id": chat_id, "type": "private", "title": ""}),
+            ))
         }
-        "sendChatAction" => Ok(json!({"ok": true, "result": true})),
+        "sendChatAction" => Ok(ok_result(json!(true))),
         _ => Err(anyhow!("unsupported Bot API method {}", method)),
     }
+}
+
+/// The envelope every Bot API method returns. Centralised so a method cannot
+/// accidentally reply with a bare payload, which clients reject.
+fn ok_result(result: Value) -> Value {
+    json!({"ok": true, "result": result})
 }
 
 fn send_message(

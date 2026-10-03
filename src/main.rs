@@ -190,7 +190,12 @@ async fn main() -> Result<()> {
                     true,
                     false,
                 )?;
-                store.set_bot_token(user.id, a.get_one::<String>("bot-token").unwrap())?;
+                let token = a.get_one::<String>("bot-token").unwrap();
+                store.set_bot_token(user.id, token)?;
+                // Re-read so the printed row reflects the token just stored.
+                let user = store
+                    .get_user(user.id)?
+                    .ok_or_else(|| anyhow::anyhow!("bot vanished"))?;
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&serde_json::json!({

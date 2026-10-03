@@ -36,6 +36,9 @@ crc32fast = "1"
 ctr = { version = "0.9", features = ["zeroize"] }
 libc = "0.2"
 
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+
 [profile.release]
 opt-level = 2
 debug = false

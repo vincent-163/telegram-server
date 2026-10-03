@@ -39,7 +39,10 @@ impl RsaKeyPair {
             };
             let n = &p * &q;
             let n_bytes = n.to_bytes_be();
-            if n_bytes.len() != 256 {
+            // Telegram requires a 2048-bit key, so the top byte must both
+            // exist and have its high bit set. Without the second check a
+            // 2047-bit modulus is accepted roughly half the time.
+            if n_bytes.len() != 256 || n_bytes[0] & 0x80 == 0 {
                 continue;
             }
             return RsaKeyPair { n, e, d, n_bytes };
