@@ -231,3 +231,86 @@ async fn server_key_is_well_formed() {
     );
     assert_eq!(v["result"]["exponent"], "65537");
 }
+
+/// Message ids are numbered per dialog, so the first message of every dialog
+/// is id 1. A global primary key on `id` cannot express that.
+#[tokio::test]
+async fn two_dialogs_can_both_hold_message_id_1() {
+    let fx = setup();
+    let other = fx
+        .store
+        .create_user("15550000002", "Peer", "Person", "peer", false, false)
+        .unwrap();
+    let bot = fx.store.get_user_by_token(TOKEN).unwrap().unwrap();
+    fx.store
+        .insert_message(
+            "user", fx.user_id, bot.id, None, "to admin", "text", None, None, 1,
+        )
+        .unwrap();
+    fx.store
+        .insert_message(
+            "user", other.id, bot.id, None, "to peer", "text", None, None, 2,
+        )
+        .unwrap();
+    let a = fx
+        .store
+        .get_message("user", fx.user_id, 1)
+        .unwrap()
+        .unwrap();
+    let b = fx.store.get_message("user", other.id, 1).unwrap().unwrap();
+    assert_eq!(a.message, "to admin");
+    assert_eq!(b.message, "to peer");
+}
+
+/// A database created with the old global primary key must still open, keep its
+/// rows, and accept a second dialog's first message afterwards.
+#[tokio::test]
+async fn legacy_messages_table_is_migrated_in_place() {
+    let dir = std::env::temp_dir().join(format!("tgsrv-migrate-{}", rand::random::<u64>()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = dir.join("legacy.db");
+    {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE messages (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 dialog_type TEXT NOT NULL,
+                 dialog_id INTEGER NOT NULL,
+                 sender_id INTEGER NOT NULL,
+                 sender_chat_id INTEGER,
+                 date INTEGER NOT NULL,
+                 message TEXT NOT NULL DEFAULT '',
+                 media_kind TEXT NOT NULL DEFAULT '',
+                 media_file_id TEXT,
+                 edited INTEGER NOT NULL DEFAULT 0,
+                 reply_to INTEGER,
+                 random_id INTEGER NOT NULL DEFAULT 0,
+                 deleted INTEGER NOT NULL DEFAULT 0
+             );
+             INSERT INTO messages (id,dialog_type,dialog_id,sender_id,date,message)
+             VALUES (1,'user',100,100,0,'legacy row');",
+        )
+        .unwrap();
+    }
+    let store = Store::open(&db).unwrap();
+    let kept = store.get_message("user", 100, 1).unwrap().unwrap();
+    assert_eq!(kept.message, "legacy row", "existing rows must survive");
+    // And a different dialog may now also use id 1.
+    store
+        .insert_message(
+            "user",
+            200,
+            200,
+            None,
+            "second dialog",
+            "text",
+            None,
+            None,
+            3,
+        )
+        .unwrap();
+    assert_eq!(
+        store.get_message("user", 200, 1).unwrap().unwrap().message,
+        "second dialog"
+    );
+}

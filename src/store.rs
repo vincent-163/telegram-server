@@ -22,6 +22,60 @@ pub fn normalize_phone(p: &str) -> String {
     p.chars().filter(|c| c.is_ascii_digit()).collect()
 }
 
+/// Rebuilds the `messages` table when it still carries the old global
+/// `id INTEGER PRIMARY KEY AUTOINCREMENT`. Message ids are per dialog, so a
+/// database created before the composite key cannot store the first message of
+/// a second dialog. Existing rows are preserved; their ids already came from a
+/// per-dialog sequence, so no renumbering is needed.
+fn migrate_messages_primary_key(conn: &Connection) -> Result<()> {
+    let sql: Option<String> = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'messages'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(sql) = sql else { return Ok(()) };
+    let normalised = sql.to_lowercase();
+    let has_global_pk =
+        normalised.contains("id integer primary key") || normalised.contains("autoincrement");
+    if !has_global_pk {
+        return Ok(());
+    }
+    conn.execute_batch(
+        "PRAGMA foreign_keys = OFF;
+         BEGIN;
+         ALTER TABLE messages RENAME TO messages_legacy;
+         CREATE TABLE messages (
+             id INTEGER NOT NULL,
+             dialog_type TEXT NOT NULL,
+             dialog_id INTEGER NOT NULL,
+             sender_id INTEGER NOT NULL,
+             sender_chat_id INTEGER,
+             date INTEGER NOT NULL,
+             message TEXT NOT NULL DEFAULT '',
+             media_kind TEXT NOT NULL DEFAULT '',
+             media_file_id TEXT,
+             edited INTEGER NOT NULL DEFAULT 0,
+             reply_to INTEGER,
+             random_id INTEGER NOT NULL DEFAULT 0,
+             deleted INTEGER NOT NULL DEFAULT 0,
+             PRIMARY KEY (dialog_type, dialog_id, id)
+         );
+         INSERT INTO messages (id,dialog_type,dialog_id,sender_id,sender_chat_id,date,message,
+                               media_kind,media_file_id,edited,reply_to,random_id,deleted)
+             SELECT id,dialog_type,dialog_id,sender_id,sender_chat_id,date,message,
+                    media_kind,media_file_id,edited,reply_to,random_id,deleted
+             FROM messages_legacy;
+         DROP TABLE messages_legacy;
+         CREATE INDEX IF NOT EXISTS messages_dialog ON messages(dialog_type, dialog_id, id DESC);
+         COMMIT;
+         PRAGMA foreign_keys = ON;",
+    )
+    .context("migrate messages primary key")?;
+    Ok(())
+}
+
 #[derive(Clone)]
 pub struct Store {
     conn: Arc<Mutex<Connection>>,
@@ -118,7 +172,7 @@ CREATE TABLE IF NOT EXISTS chat_members (
 );
 
 CREATE TABLE IF NOT EXISTS messages (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    id INTEGER NOT NULL,
     dialog_type TEXT NOT NULL,
     dialog_id INTEGER NOT NULL,
     sender_id INTEGER NOT NULL,
@@ -130,7 +184,11 @@ CREATE TABLE IF NOT EXISTS messages (
     edited INTEGER NOT NULL DEFAULT 0,
     reply_to INTEGER,
     random_id INTEGER NOT NULL DEFAULT 0,
-    deleted INTEGER NOT NULL DEFAULT 0
+    deleted INTEGER NOT NULL DEFAULT 0,
+    -- Telegram numbers messages per dialog, so two dialogs each have a
+    -- message with id 1. A global primary key on `id` alone cannot express
+    -- that and makes the second dialog's first message collide.
+    PRIMARY KEY (dialog_type, dialog_id, id)
 );
 CREATE INDEX IF NOT EXISTS messages_dialog ON messages(dialog_type, dialog_id, id DESC);
 
@@ -235,6 +293,7 @@ impl Store {
     pub fn open(path: &Path) -> Result<Self> {
         let conn = Connection::open(path).context("open sqlite")?;
         conn.execute_batch(SCHEMA).context("apply schema")?;
+        migrate_messages_primary_key(&conn)?;
         Ok(Store {
             conn: Arc::new(Mutex::new(conn)),
         })
