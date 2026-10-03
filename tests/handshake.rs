@@ -8,11 +8,45 @@ use telegram_server::crypto::{
 };
 use telegram_server::mtproto::{Handshake, RsaKeyPair};
 
+/// `resPQ` must echo the client's nonce (not the placeholder the handshake
+/// object was constructed with) and must be serialized with its constructor
+/// id, which clients use to recognize the reply.
+#[test]
+fn res_pq_echoes_client_nonce_and_carries_ctor() {
+    let key = RsaKeyPair::generate();
+    let mut handshake = Handshake::new([0u8; 16]);
+    let client_nonce = [0xAB; 16];
+    handshake.set_nonce(client_nonce);
+
+    let res_pq = handshake.step1(&key).unwrap();
+    let bytes = res_pq.to_bytes();
+    assert_eq!(
+        u32::from_le_bytes(bytes[0..4].try_into().unwrap()),
+        0x05162463,
+        "resPQ must be serialized with its constructor id"
+    );
+    assert_eq!(
+        &bytes[4..20],
+        &client_nonce[..],
+        "resPQ must echo the client nonce"
+    );
+
+    let tl::enums::ResPq::Pq(inner) = res_pq;
+    assert_eq!(inner.nonce, client_nonce);
+    assert_ne!(inner.server_nonce, client_nonce, "server nonce must differ");
+    assert_eq!(inner.pq.len(), 8, "pq must be an 8-byte big-endian value");
+    assert_eq!(
+        inner.server_public_key_fingerprints,
+        vec![key.fingerprint()]
+    );
+}
+
 #[test]
 fn complete_authorization_handshake() {
     let key = RsaKeyPair::generate();
     let mut handshake = Handshake::new([0x11; 16]);
     let res_pq = handshake.step1(&key).unwrap();
+    let tl::enums::ResPq::Pq(res_pq) = res_pq;
     assert_eq!(res_pq.nonce, [0x11; 16]);
     assert_eq!(
         res_pq.server_public_key_fingerprints,
@@ -156,4 +190,98 @@ fn official_rsa_fingerprint_matches_tdesktop_format() {
     .unwrap();
     let key = RsaPublicKey::from_bytes(&modulus, 0x010001).unwrap();
     assert_eq!(key.fingerprint() as u64, 0xd09d1d85de64fd85);
+}
+
+/// Minimal DER walker: returns `(tag, content)` for one TLV at `i`.
+fn der_read(buf: &[u8], i: &mut usize) -> (u8, Vec<u8>) {
+    let tag = buf[*i];
+    *i += 1;
+    let mut len = buf[*i] as usize;
+    *i += 1;
+    if len & 0x80 != 0 {
+        let n = len & 0x7f;
+        len = 0;
+        for _ in 0..n {
+            len = (len << 8) | buf[*i] as usize;
+            *i += 1;
+        }
+    }
+    let out = buf[*i..*i + len].to_vec();
+    *i += len;
+    (tag, out)
+}
+
+/// Extract the two INTEGERs (modulus, exponent) from a PKCS#1 RSAPublicKey
+/// sequence.
+fn pkcs1_ints(der: &[u8]) -> Vec<Vec<u8>> {
+    let mut i = 0;
+    let (tag, seq) = der_read(der, &mut i);
+    assert_eq!(tag, 0x30, "expected a SEQUENCE");
+    assert_eq!(i, der.len(), "trailing bytes after the SEQUENCE");
+    let mut j = 0;
+    let mut out = Vec::new();
+    while j < seq.len() {
+        let (t, v) = der_read(&seq, &mut j);
+        assert_eq!(t, 0x02, "expected an INTEGER");
+        out.push(v);
+    }
+    out
+}
+
+/// Unwrap a SubjectPublicKeyInfo into its inner PKCS#1 sequence.
+fn spki_inner(der: &[u8]) -> Vec<u8> {
+    let mut i = 0;
+    let (tag, seq) = der_read(der, &mut i);
+    assert_eq!(tag, 0x30, "expected an outer SEQUENCE");
+    let mut j = 0;
+    let (alg_tag, _alg) = der_read(&seq, &mut j);
+    assert_eq!(alg_tag, 0x30, "expected an AlgorithmIdentifier SEQUENCE");
+    let (bs_tag, bits) = der_read(&seq, &mut j);
+    assert_eq!(bs_tag, 0x03, "expected a BIT STRING");
+    assert_eq!(bits[0], 0x00, "BIT STRING must have no unused bits");
+    bits[1..].to_vec()
+}
+
+fn pem_der(pem: &str) -> Vec<u8> {
+    use base64::Engine;
+    let body: String = pem.lines().filter(|l| !l.starts_with("-----")).collect();
+    base64::engine::general_purpose::STANDARD
+        .decode(body.trim())
+        .expect("PEM body must be valid base64")
+}
+
+/// The advertised PEMs must be parseable as positive DER INTEGERs. A
+/// 2048-bit modulus always has its high bit set, so omitting the DER sign
+/// byte makes both encodings describe a negative number, which standard RSA
+/// parsers reject outright.
+#[test]
+fn advertised_public_keys_are_valid_der() {
+    let key = RsaKeyPair::generate();
+
+    let pkcs1 = pkcs1_ints(&pem_der(&key.public_pem_rsa()));
+    let spki = pkcs1_ints(&spki_inner(&pem_der(&key.public_pem())));
+    assert_eq!(pkcs1, spki, "both encodings must describe the same key");
+
+    for (idx, v) in pkcs1.iter().enumerate() {
+        assert!(!v.is_empty(), "INTEGER {idx} must not be empty");
+        assert!(
+            v[0] & 0x80 == 0,
+            "INTEGER {idx} must be non-negative (missing DER sign byte)"
+        );
+    }
+    // The encoded length must match the value: a 256-byte modulus needs one
+    // extra sign byte exactly when its high bit is set.
+    let n = &pkcs1[0];
+    let expected = if n[0] == 0x00 { 257 } else { 256 };
+    assert_eq!(n.len(), expected, "modulus DER length must match its value");
+    assert!(n.len() >= 256, "modulus must be at least 2048 bits");
+
+    // A modulus with the high bit set is the shape real Telegram server keys
+    // have, and the one that used to be encoded as a negative number.
+    let high_bit = if n[0] == 0x00 { n[1] } else { n[0] };
+    assert_eq!(
+        high_bit & 0x80,
+        0x80,
+        "a 2048-bit modulus always has its high bit set"
+    );
 }

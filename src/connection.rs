@@ -66,11 +66,12 @@ async fn handle(
             encoder = Some(enc);
         }
         while let Some(mut payload) = decoder.next_payload()? {
-            // Padded-intermediate transport padding is not part of the MTProto packet.
-            if payload.len() > 24 && (payload.len() - 24) % 16 != 0 {
-                let trim = (payload.len() - 24) % 16;
-                payload.truncate(payload.len() - trim);
-            }
+            // Padded-intermediate appends random transport padding. Recover the
+            // exact MTProto packet from its own framing: plain messages declare
+            // their length in bytes 16..20, encrypted ones end on a 16-byte
+            // boundary. Trimming plain messages to a 16-byte boundary (the old
+            // behaviour) truncated larger requests such as req_DH_params.
+            trim_transport_padding(&mut payload);
             if let Some(key) = auth_key.as_ref() {
                 let env = match EncryptedEnvelope::decode(&payload, key) {
                     Ok(v) => v,
@@ -115,9 +116,11 @@ async fn handle(
             let ctor = u32::from_le_bytes(body[0..4].try_into().unwrap());
             let response_body = match ctor {
                 0x60469778 | 0xbe7e8ef1 => {
-                    let _ = grammers_tl_types::functions::ReqPqMulti::deserialize(
-                        &mut grammers_tl_types::Cursor::from_slice(&body),
-                    )?;
+                    // Both req_pq#60469778 and req_pq_multi#be7e8ef1 carry the
+                    // client nonce, which resPQ must echo back.
+                    let mut cur = grammers_tl_types::Cursor::from_slice(&body[4..]);
+                    let nonce = <[u8; 16] as Deserializable>::deserialize(&mut cur)?;
+                    handshake.set_nonce(nonce);
                     handshake.step1(&rsa)?.to_bytes()
                 }
                 0xd712e4be => {
@@ -146,6 +149,72 @@ async fn handle(
                 break;
             }
         }
+    }
+}
+
+/// Drop transport padding from a decoded MTProto packet.
+///
+/// `auth_key_id == 0` marks a plain message, whose declared body length is at
+/// bytes 16..20. Encrypted messages carry `auth_key_id` then a 16-byte message
+/// key, and the AES-IGE payload is always a multiple of 16.
+fn trim_transport_padding(payload: &mut Vec<u8>) {
+    if payload.len() < 4 {
+        return;
+    }
+    let is_plain = payload.len() >= 8 && payload[0..8] == [0u8; 8];
+    if is_plain {
+        if payload.len() >= 20 {
+            let declared = i32::from_le_bytes(payload[16..20].try_into().unwrap());
+            if declared > 0 {
+                let end = 20 + declared as usize;
+                if end <= payload.len() {
+                    payload.truncate(end);
+                }
+            }
+        }
+    } else {
+        if payload.len() > 24 {
+            let trim = (payload.len() - 24) % 16;
+            if trim != 0 {
+                payload.truncate(payload.len() - trim);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::trim_transport_padding;
+
+    #[test]
+    fn trims_plain_message_padding() {
+        let mut p = Vec::new();
+        p.extend_from_slice(&0i64.to_le_bytes()); // auth key id
+        p.extend_from_slice(&1i64.to_le_bytes()); // msg id
+        p.extend_from_slice(&3i32.to_le_bytes()); // declared body length
+        p.extend_from_slice(b"abc");
+        p.extend_from_slice(&[0xaa; 5]); // transport padding
+        trim_transport_padding(&mut p);
+        assert_eq!(p.len(), 23);
+    }
+
+    #[test]
+    fn leaves_large_plain_messages_intact() {
+        let mut p = Vec::new();
+        p.extend_from_slice(&0i64.to_le_bytes());
+        p.extend_from_slice(&1i64.to_le_bytes());
+        p.extend_from_slice(&400i32.to_le_bytes());
+        p.extend_from_slice(&vec![7u8; 400]);
+        trim_transport_padding(&mut p);
+        assert_eq!(p.len(), 420);
+    }
+
+    #[test]
+    fn trims_encrypted_padding_to_16() {
+        let mut p = vec![0u8; 24 + 64 + 3];
+        p[0..8].copy_from_slice(&1i64.to_le_bytes()); // encrypted
+        trim_transport_padding(&mut p);
+        assert_eq!(p.len(), 24 + 64);
     }
 }
 

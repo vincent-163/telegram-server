@@ -126,8 +126,17 @@ impl RsaKeyPair {
     fn pkcs1_der(&self) -> Vec<u8> {
         let mut ints = Vec::new();
         for value in [self.n.clone(), self.e.clone()] {
-            let bytes = value.to_bytes_be();
-            let bytes = if bytes.is_empty() { vec![0] } else { bytes };
+            let mut bytes = value.to_bytes_be();
+            if bytes.is_empty() {
+                bytes.push(0);
+            }
+            // DER INTEGERs are signed, so a value whose most significant bit
+            // is set needs a leading zero byte. A 2048-bit modulus always has
+            // it set, and without this the PEM encodes a negative number that
+            // standard RSA parsers reject.
+            if bytes[0] & 0x80 != 0 {
+                bytes.insert(0, 0);
+            }
             ints.push(0x02);
             ints.extend_from_slice(&der_len(bytes.len()));
             ints.extend_from_slice(&bytes);
@@ -272,7 +281,17 @@ impl Handshake {
         }
     }
 
-    pub fn step1(&mut self, key: &RsaKeyPair) -> Result<tl::types::ResPq> {
+    /// Returns the `resPQ` *enum*, whose `to_bytes()` includes the
+    /// constructor id. Serializing the bare `types::ResPq` would omit it and
+    /// clients would reject the reply as an unknown constructor.
+    /// Record the client nonce from `req_pq`/`req_pq_multi`. The handshake
+    /// object is created before the request arrives, so the nonce it was
+    /// constructed with is only a placeholder.
+    pub fn set_nonce(&mut self, nonce: [u8; 16]) {
+        self.nonce = nonce;
+    }
+
+    pub fn step1(&mut self, key: &RsaKeyPair) -> Result<tl::enums::ResPq> {
         if self.state != HandshakePhase::WaitingPq {
             bail!("handshake out of order");
         }
@@ -286,12 +305,12 @@ impl Handshake {
         self.q = Some(u64::from_be_bytes(pad8(&qb)));
         self.state = HandshakePhase::WaitingDhParams;
         let fingerprint = key.fingerprint();
-        Ok(tl::types::ResPq {
+        Ok(tl::enums::ResPq::Pq(tl::types::ResPq {
             nonce: self.nonce,
             server_nonce,
             pq: pqb.to_vec(),
             server_public_key_fingerprints: vec![fingerprint],
-        })
+        }))
     }
 
     pub fn step2(

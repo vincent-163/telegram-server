@@ -391,7 +391,10 @@ impl Encoder {
             TransportKind::Full => {
                 let length = (payload.len() + 12) as u32;
                 out.extend_from_slice(&length.to_le_bytes());
-                out.extend_from_slice(&self.full_seq.to_le_bytes());
+                // The sequence field is 4 bytes on the wire; `full_seq` is a
+                // u64 counter, so it must be truncated rather than serialized
+                // whole (writing 8 bytes shifts the payload by four).
+                out.extend_from_slice(&(self.full_seq as u32).to_le_bytes());
                 out.extend_from_slice(payload);
                 let mut hasher = crc32fast::Hasher::new();
                 hasher.update(&out);
@@ -464,6 +467,37 @@ mod tests {
         let got = dec.next_payload().unwrap().unwrap();
         assert!(got.starts_with(&payload));
         assert!(got.len() - payload.len() < 4);
+    }
+
+    #[test]
+    fn full_roundtrip() {
+        let mut enc = Encoder::new(TransportKind::Full);
+        let payload = vec![5u8; 40];
+        let frame = enc.encode(&payload).unwrap();
+        let length = u32::from_le_bytes(frame[0..4].try_into().unwrap()) as usize;
+        assert_eq!(
+            length,
+            frame.len(),
+            "length field must cover the whole frame"
+        );
+        assert_eq!(length, payload.len() + 12);
+        let seq = u32::from_le_bytes(frame[4..8].try_into().unwrap());
+        assert_eq!(seq, 0);
+        let crc = u32::from_le_bytes(frame[length - 4..length].try_into().unwrap());
+        assert_eq!(crc, crc32fast::hash(&frame[..length - 4]));
+
+        let mut dec = Decoder::new();
+        dec.push(&frame).unwrap();
+        assert!(dec.ensure_started().unwrap());
+        assert_eq!(dec.kind(), Some(TransportKind::Full));
+        assert_eq!(
+            dec.next_payload().unwrap().as_deref(),
+            Some(payload.as_slice())
+        );
+
+        // A second frame must carry the next sequence number.
+        let frame2 = enc.encode(&payload).unwrap();
+        assert_eq!(u32::from_le_bytes(frame2[4..8].try_into().unwrap()), 1);
     }
 
     #[test]
