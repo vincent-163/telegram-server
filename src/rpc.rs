@@ -6,6 +6,7 @@ use grammers_tl_types as tl;
 use grammers_tl_types::{Deserializable, Serializable};
 use std::sync::Arc;
 
+use crate::compat;
 use crate::config::Config;
 use crate::store::{now, MessageRow, Store, UserRow};
 
@@ -139,12 +140,12 @@ fn dispatch_inner(ctx: &mut RpcContext, body: &[u8], ctor: u32) -> Result<Vec<u8
                     out.push(build_user(ctx, &u)?);
                 }
             }
-            return Ok(tl::RawVec::<tl::enums::User>(out).to_bytes());
+            return Ok(out.to_bytes());
         }
         0xb60f5918 => {
-            let _f =
+            let f =
                 tl::functions::users::GetFullUser::deserialize(&mut tl::Cursor::from_slice(body))?;
-            return bail_rpc(400, "USER_FULL_UNSUPPORTED");
+            return handle_get_full_user(ctx, &f);
         }
 
         // ---------------------------------------------------------- account
@@ -200,23 +201,111 @@ fn dispatch_inner(ctx: &mut RpcContext, body: &[u8], ctor: u32) -> Result<Vec<u8
             return handle_read_history(ctx, &f);
         }
         0x63c66506 => {
-            // messages.getChats
-            let f =
-                tl::functions::messages::GetChats::deserialize(&mut tl::Cursor::from_slice(body))?;
-            let mut chats = Vec::new();
-            for id in &f.id {
-                if let Some(c) = store.get_chat(*id)? {
-                    chats.push(build_chat(&c, 0));
-                }
-            }
-            return Ok(tl::RawVec::<tl::enums::Chat>(chats).to_bytes());
+            // messages.getMessages
+            let f = tl::functions::messages::GetMessages::deserialize(
+                &mut tl::Cursor::from_slice(body),
+            )?;
+            return handle_get_messages(ctx, &f);
         }
         0xa6f47c87 => {
             // messages.getFullChat
             let f = tl::functions::messages::GetFullChat::deserialize(
                 &mut tl::Cursor::from_slice(body),
             )?;
-            return handle_get_full_chat(ctx, &f);
+            return handle_get_full_chat_real(ctx, &f);
+        }
+        // ------------------------------------------------- real handlers
+        0xe470bcfd => {
+            let f = tl::functions::messages::GetPeerDialogs::deserialize(
+                &mut tl::Cursor::from_slice(body),
+            )?;
+            return handle_get_peer_dialogs(ctx, &f);
+        }
+        0xd6b94df2 => return handle_get_pinned_dialogs(ctx),
+        0x29ee847a => {
+            let f =
+                tl::functions::messages::Search::deserialize(&mut tl::Cursor::from_slice(body))?;
+            return handle_search(ctx, &f);
+        }
+        0xefd9a6a2 => {
+            let f = tl::functions::messages::GetPeerSettings::deserialize(
+                &mut tl::Cursor::from_slice(body),
+            )?;
+            return handle_get_peer_settings(ctx, &f);
+        }
+        0x725afbbc => {
+            let f = tl::functions::contacts::ResolveUsername::deserialize(
+                &mut tl::Cursor::from_slice(body),
+            )?;
+            return handle_resolve_username(ctx, &f);
+        }
+        0x5f58d0f => {
+            let f =
+                tl::functions::contacts::Search::deserialize(&mut tl::Cursor::from_slice(body))?;
+            return handle_contacts_search(ctx, &f);
+        }
+        0xe40ca104 => {
+            let f = tl::functions::messages::GetCommonChats::deserialize(
+                &mut tl::Cursor::from_slice(body),
+            )?;
+            return handle_get_common_chats(ctx, &f);
+        }
+        0x49e9528f => {
+            let f =
+                tl::functions::messages::GetChats::deserialize(&mut tl::Cursor::from_slice(body))?;
+            return handle_get_chats(ctx, &f);
+        }
+        0xa7f6bbb => {
+            let f = tl::functions::channels::GetChannels::deserialize(
+                &mut tl::Cursor::from_slice(body),
+            )?;
+            return handle_get_channels(ctx, &f);
+        }
+        0x77ced9d0 => {
+            let f = tl::functions::channels::GetParticipants::deserialize(
+                &mut tl::Cursor::from_slice(body),
+            )?;
+            return handle_get_participants(ctx, &f);
+        }
+        0x91cd32a8 => {
+            let f = tl::functions::photos::GetUserPhotos::deserialize(
+                &mut tl::Cursor::from_slice(body),
+            )?;
+            return handle_get_user_photos(ctx, &f);
+        }
+        0x12b3ad31 => {
+            let f = tl::functions::account::GetNotifySettings::deserialize(
+                &mut tl::Cursor::from_slice(body),
+            )?;
+            return handle_get_notify_settings(ctx, &f);
+        }
+        0x84be5b93 => {
+            let f = tl::functions::account::UpdateNotifySettings::deserialize(
+                &mut tl::Cursor::from_slice(body),
+            )?;
+            return handle_update_notify_settings(ctx, &f);
+        }
+        0xe320c158 => return handle_get_authorizations(ctx),
+        0xbe5335be => {
+            let f = tl::functions::upload::GetFile::deserialize(&mut tl::Cursor::from_slice(body))?;
+            return handle_upload_get_file(ctx, &f);
+        }
+        0x61e3f854 => return handle_get_app_config(ctx),
+        0x9cdf08cd => return handle_get_support(ctx),
+        0xdf77f3bc => {
+            let f = tl::functions::account::ResetAuthorization::deserialize(
+                &mut tl::Cursor::from_slice(body),
+            )?;
+            return handle_reset_authorization(ctx, f.hash);
+        }
+        0x9fab0d1a => {
+            let keep = ctx
+                .store
+                .sessions_for_user(ctx.user_id)?
+                .first()
+                .map(|(id, _, _, _, _, _)| id.clone());
+            ctx.store.drop_all_sessions(ctx.user_id, keep.as_deref())?;
+            return Ok(true.to_bytes());
         }
         0x628006bc => {
             // messages.createChat
@@ -323,7 +412,7 @@ fn dispatch_inner(ctx: &mut RpcContext, body: &[u8], ctor: u32) -> Result<Vec<u8
             let _f = tl::functions::langpack::GetLanguages::deserialize(
                 &mut tl::Cursor::from_slice(body),
             )?;
-            return Ok(tl::RawVec::<tl::enums::LangPackLanguage>(Vec::new()).to_bytes());
+            return Ok(Vec::<tl::enums::LangPackLanguage>::new().to_bytes());
         }
         0x6a596502 => {
             let f = tl::functions::langpack::GetDifference::deserialize(
@@ -355,9 +444,794 @@ fn dispatch_inner(ctx: &mut RpcContext, body: &[u8], ctor: u32) -> Result<Vec<u8
         }
 
         _ => {
+            if let Some(body) = compat::default_response(ctor) {
+                return Ok(body);
+            }
             let name = tl::name_for_id(ctor);
             return bail_rpc(400, &format!("RPC_ERROR: unsupported method {}", name));
         }
+    }
+}
+
+// ============================================================ new handlers
+
+/// Resolve an `InputUser` to a concrete `UserRow`, including `inputUserSelf`.
+fn resolve_user_any(ctx: &RpcContext, i: &tl::enums::InputUser) -> Result<Option<UserRow>> {
+    use tl::enums::InputUser as U;
+    match i {
+        U::UserSelf => ctx.store.get_user(ctx.user_id),
+        other => resolve_input_user(&ctx.store, other),
+    }
+}
+
+/// Build a `messages.PeerDialogs` response from the user's dialog list,
+/// optionally restricted to a set of peers.
+fn build_peer_dialogs(ctx: &RpcContext, only: Option<&[tl::enums::Peer]>) -> Result<Vec<u8>> {
+    let rows = ctx.store.dialogs_for(ctx.user_id)?;
+    let mut dialogs = Vec::new();
+    let mut messages = Vec::new();
+    let mut users = Vec::new();
+    let mut chats = Vec::new();
+    for row in &rows {
+        let peer = dialog_peer(&row.dialog_type, row.dialog_id);
+        if let Some(want) = only {
+            if !want.contains(&peer) {
+                continue;
+            }
+        }
+        let top = if row.top_message > 0 {
+            find_message(ctx, &row.dialog_type, row.dialog_id, row.top_message)?
+        } else {
+            None
+        };
+        if let Some(m) = top {
+            messages.push(build_message(&m, self_peer(&m, ctx.user_id)));
+        }
+        let dlg = tl::types::Dialog {
+            pinned: row.pinned,
+            unread_mark: false,
+            view_forum_as_messages: false,
+            peer: peer.clone(),
+            top_message: row.top_message,
+            read_inbox_max_id: row.read_max_id,
+            read_outbox_max_id: 0,
+            unread_count: row.unread_count,
+            unread_mentions_count: 0,
+            unread_reactions_count: 0,
+            unread_poll_votes_count: 0,
+            notify_settings: default_notify(),
+            pts: None,
+            draft: None,
+            folder_id: None,
+            ttl_period: None,
+        };
+        dialogs.push(tl::enums::Dialog::Dialog(dlg));
+        collect_refs(ctx, &peer, &mut users, &mut chats)?;
+    }
+    let (pts, qts, seq, date) = ctx.store.state_for(ctx.user_id)?;
+    let resp = tl::types::messages::PeerDialogs {
+        dialogs,
+        messages,
+        chats,
+        users,
+        state: tl::enums::updates::State::State(tl::types::updates::State {
+            pts,
+            qts,
+            date: date as i32,
+            seq,
+            unread_count: 0,
+        }),
+    };
+    Ok(tl::enums::messages::PeerDialogs::Dialogs(resp).to_bytes())
+}
+
+fn handle_get_peer_dialogs(
+    ctx: &RpcContext,
+    f: &tl::functions::messages::GetPeerDialogs,
+) -> Result<Vec<u8>> {
+    let mut want = Vec::new();
+    for p in &f.peers {
+        if let tl::enums::InputDialogPeer::Peer(ip) = p {
+            if let Ok((kind, id)) = resolve_peer(&ip.peer) {
+                if kind == "self" {
+                    want.push(tl::enums::Peer::User(tl::types::PeerUser {
+                        user_id: ctx.user_id,
+                    }));
+                } else {
+                    want.push(dialog_peer(&kind, id));
+                }
+            }
+        }
+    }
+    build_peer_dialogs(ctx, Some(&want))
+}
+
+/// `messages.getMessages` — fetch a specific set of message ids.
+fn handle_get_messages(
+    ctx: &RpcContext,
+    f: &tl::functions::messages::GetMessages,
+) -> Result<Vec<u8>> {
+    let mut messages = Vec::new();
+    let mut users = Vec::new();
+    let mut chats = Vec::new();
+    let dialogs = ctx.store.dialogs_for(ctx.user_id)?;
+    let mut wanted: Vec<i32> = Vec::new();
+    for i in &f.id {
+        if let tl::enums::InputMessage::Id(x) = i {
+            wanted.push(x.id);
+        }
+    }
+    for row in &dialogs {
+        for id in &wanted {
+            if let Some(m) = find_message(ctx, &row.dialog_type, row.dialog_id, *id)? {
+                let peer = peer_of_dialog(&row.dialog_type, row.dialog_id, ctx.user_id);
+                messages.push(build_message(&m, peer.clone()));
+                collect_refs(ctx, &peer, &mut users, &mut chats)?;
+            }
+        }
+    }
+    let resp = tl::types::messages::Messages {
+        messages,
+        topics: Vec::new(),
+        chats,
+        users,
+    };
+    Ok(tl::enums::messages::Messages::Messages(resp).to_bytes())
+}
+
+/// `messages.search` — substring search over the user's message history.
+fn handle_search(ctx: &RpcContext, f: &tl::functions::messages::Search) -> Result<Vec<u8>> {
+    let (kind, id) = resolve_peer(&f.peer)?;
+    let (kind_opt, id_opt) = if kind == "self" {
+        (None, None)
+    } else {
+        (Some(kind.as_str()), Some(id))
+    };
+    let from = match &f.from_id {
+        Some(p) => match resolve_peer(p) {
+            Ok((k, _)) if k == "self" => Some(ctx.user_id),
+            Ok((_, v)) => Some(v),
+            Err(_) => None,
+        },
+        None => None,
+    };
+    let rows = ctx
+        .store
+        .search_messages(kind_opt, id_opt, from, &f.q, f.limit, f.offset_id)?;
+    let mut messages = Vec::new();
+    let mut users = Vec::new();
+    let mut chats = Vec::new();
+    for r in &rows {
+        let peer = peer_of_dialog(&r.dialog_type, r.dialog_id, ctx.user_id);
+        messages.push(build_message(r, peer.clone()));
+        collect_refs(ctx, &peer, &mut users, &mut chats)?;
+    }
+    let resp = tl::types::messages::Messages {
+        messages,
+        topics: Vec::new(),
+        chats,
+        users,
+    };
+    Ok(tl::enums::messages::Messages::Messages(resp).to_bytes())
+}
+
+/// `messages.getPeerSettings` — default settings for any peer.
+fn handle_get_peer_settings(
+    ctx: &RpcContext,
+    f: &tl::functions::messages::GetPeerSettings,
+) -> Result<Vec<u8>> {
+    let (kind, id) = resolve_peer(&f.peer)?;
+    let mut users = Vec::new();
+    let mut chats = Vec::new();
+    if kind != "self" {
+        let peer = dialog_peer(&kind, id);
+        collect_refs(ctx, &peer, &mut users, &mut chats)?;
+    }
+    let settings = tl::types::PeerSettings {
+        report_spam: false,
+        add_contact: false,
+        block_contact: false,
+        share_contact: true,
+        need_contacts_exception: false,
+        report_geo: false,
+        autoarchived: false,
+        invite_members: false,
+        request_chat_broadcast: false,
+        business_bot_paused: false,
+        business_bot_can_reply: false,
+        geo_distance: None,
+        request_chat_title: None,
+        request_chat_date: None,
+        business_bot_id: None,
+        business_bot_manage_url: None,
+        charge_paid_message_stars: None,
+        registration_month: None,
+        phone_country: None,
+        name_change_date: None,
+        photo_change_date: None,
+    };
+    let resp = tl::types::messages::PeerSettings {
+        settings: tl::enums::PeerSettings::Settings(settings),
+        chats,
+        users,
+    };
+    Ok(tl::enums::messages::PeerSettings::Settings(resp).to_bytes())
+}
+
+/// `users.getFullUser` — the profile card the client opens for a user.
+fn handle_get_full_user(
+    ctx: &RpcContext,
+    f: &tl::functions::users::GetFullUser,
+) -> Result<Vec<u8>> {
+    let target = resolve_user_any(ctx, &f.id)?.ok_or_else(|| anyhow!("user not found"))?;
+    let mut chats = Vec::new();
+    let users = vec![build_user(ctx, &target)?];
+    let common = ctx.store.chat_members_shared(ctx.user_id, target.id)?;
+    for c in &common {
+        let members = ctx.store.chat_members(c.id)?.len() as i32;
+        chats.push(build_chat(c, members));
+    }
+    let notify = ctx
+        .store
+        .get_notify_settings(ctx.user_id, &format!("user:{}", target.id))?
+        .and_then(|j| parse_notify_settings(&j))
+        .unwrap_or_else(default_notify);
+    let settings = tl::types::PeerSettings {
+        report_spam: false,
+        add_contact: false,
+        block_contact: false,
+        share_contact: true,
+        need_contacts_exception: false,
+        report_geo: false,
+        autoarchived: false,
+        invite_members: false,
+        request_chat_broadcast: false,
+        business_bot_paused: false,
+        business_bot_can_reply: false,
+        geo_distance: None,
+        request_chat_title: None,
+        request_chat_date: None,
+        business_bot_id: None,
+        business_bot_manage_url: None,
+        charge_paid_message_stars: None,
+        registration_month: None,
+        phone_country: None,
+        name_change_date: None,
+        photo_change_date: None,
+    };
+    let full = tl::types::UserFull {
+        blocked: false,
+        phone_calls_available: false,
+        phone_calls_private: true,
+        can_pin_message: false,
+        has_scheduled: false,
+        video_calls_available: false,
+        voice_messages_forbidden: false,
+        translations_disabled: true,
+        stories_pinned_available: false,
+        blocked_my_stories_from: false,
+        wallpaper_overridden: false,
+        contact_require_premium: false,
+        read_dates_private: true,
+        sponsored_enabled: false,
+        can_view_revenue: false,
+        bot_can_manage_emoji_status: false,
+        display_gifts_button: false,
+        noforwards_my_enabled: false,
+        noforwards_peer_enabled: false,
+        unofficial_security_risk: false,
+        id: target.id,
+        about: Some(target.about.clone()).filter(|s| !s.is_empty()),
+        settings: tl::enums::PeerSettings::Settings(settings),
+        personal_photo: None,
+        profile_photo: Some(tl::enums::Photo::Empty(tl::types::PhotoEmpty { id: 0 })),
+        fallback_photo: None,
+        notify_settings: notify,
+        bot_info: if target.is_bot {
+            Some(tl::enums::BotInfo::Info(tl::types::BotInfo {
+                has_preview_medias: false,
+                user_id: Some(target.id),
+                description: Some(target.about.clone()),
+                description_photo: None,
+                description_document: None,
+                commands: Some(Vec::new()),
+                menu_button: None,
+                privacy_policy_url: None,
+                app_settings: None,
+                verifier_settings: None,
+            }))
+        } else {
+            None
+        },
+        pinned_msg_id: None,
+        common_chats_count: common.len() as i32,
+        folder_id: None,
+        ttl_period: None,
+        theme: None,
+        private_forward_name: None,
+        bot_group_admin_rights: None,
+        bot_broadcast_admin_rights: None,
+        wallpaper: None,
+        stories: None,
+        business_work_hours: None,
+        business_location: None,
+        business_greeting_message: None,
+        business_away_message: None,
+        business_intro: None,
+        birthday: None,
+        personal_channel_id: None,
+        personal_channel_message: None,
+        stargifts_count: None,
+        starref_program: None,
+        bot_verification: None,
+        send_paid_messages_stars: None,
+        disallowed_gifts: None,
+        stars_rating: None,
+        stars_my_pending_rating: None,
+        stars_my_pending_rating_date: None,
+        main_tab: None,
+        saved_music: None,
+        note: None,
+        bot_manager_id: None,
+    };
+    let resp = tl::types::users::UserFull {
+        full_user: tl::enums::UserFull::Full(full),
+        chats,
+        users,
+    };
+    Ok(tl::enums::users::UserFull::Full(resp).to_bytes())
+}
+
+/// `contacts.resolveUsername` — username -> peer lookup.
+fn handle_resolve_username(
+    ctx: &RpcContext,
+    f: &tl::functions::contacts::ResolveUsername,
+) -> Result<Vec<u8>> {
+    let name = f.username.trim_start_matches('@').to_string();
+    let mut users = Vec::new();
+    let mut chats = Vec::new();
+    let peer = if let Some(u) = ctx.store.get_user_by_username(&name)? {
+        users.push(build_user(ctx, &u)?);
+        tl::enums::Peer::User(tl::types::PeerUser { user_id: u.id })
+    } else {
+        bail_rpc(400, "USERNAME_NOT_OCCUPIED")?
+    };
+    let resp = tl::types::contacts::ResolvedPeer {
+        peer,
+        chats: std::mem::take(&mut chats),
+        users,
+    };
+    Ok(tl::enums::contacts::ResolvedPeer::Peer(resp).to_bytes())
+}
+
+/// `contacts.search` — search users and chats by name or username.
+fn handle_contacts_search(
+    ctx: &RpcContext,
+    f: &tl::functions::contacts::Search,
+) -> Result<Vec<u8>> {
+    let q = f.q.to_lowercase();
+    let limit = f.limit.clamp(1, 100) as usize;
+    let mut users = Vec::new();
+    let mut results = Vec::new();
+    if !q.is_empty() {
+        for u in ctx.store.all_users()? {
+            if results.len() >= limit {
+                break;
+            }
+            let hay = format!("{} {} {}", u.first_name, u.last_name, u.username).to_lowercase();
+            if hay.contains(&q) {
+                results.push(tl::enums::Peer::User(tl::types::PeerUser { user_id: u.id }));
+                users.push(build_user(ctx, &u)?);
+            }
+        }
+    }
+    let resp = tl::types::contacts::Found {
+        my_results: Vec::new(),
+        results,
+        chats: Vec::new(),
+        users,
+    };
+    Ok(tl::enums::contacts::Found::Found(resp).to_bytes())
+}
+
+/// `messages.getCommonChats` — chats both users belong to.
+fn handle_get_common_chats(
+    ctx: &RpcContext,
+    f: &tl::functions::messages::GetCommonChats,
+) -> Result<Vec<u8>> {
+    let other = resolve_user_any(ctx, &f.user_id)?.ok_or_else(|| anyhow!("user not found"))?;
+    let common = ctx.store.chat_members_shared(ctx.user_id, other.id)?;
+    let mut chats = Vec::new();
+    for c in &common {
+        let members = ctx.store.chat_members(c.id)?.len() as i32;
+        chats.push(build_chat(c, members));
+    }
+    Ok(tl::enums::messages::Chats::Chats(tl::types::messages::Chats { chats }).to_bytes())
+}
+
+/// `messages.getChats` — resolve a list of chat ids.
+fn handle_get_chats(ctx: &RpcContext, f: &tl::functions::messages::GetChats) -> Result<Vec<u8>> {
+    let mut chats = Vec::new();
+    for id in &f.id {
+        if let Some(c) = ctx.store.get_chat(*id)? {
+            let members = ctx.store.chat_members(c.id)?.len() as i32;
+            chats.push(build_chat(&c, members));
+        }
+    }
+    Ok(tl::enums::messages::Chats::Chats(tl::types::messages::Chats { chats }).to_bytes())
+}
+
+/// `messages.getFullChat` — basic group profile.
+fn handle_get_full_chat_real(
+    ctx: &RpcContext,
+    f: &tl::functions::messages::GetFullChat,
+) -> Result<Vec<u8>> {
+    let chat = ctx
+        .store
+        .get_chat(f.chat_id)?
+        .ok_or_else(|| anyhow!("chat not found"))?;
+    let members = ctx.store.chat_members(chat.id)?;
+    let mut participants = Vec::new();
+    let mut users = Vec::new();
+    for (uid, role) in &members {
+        let admin = role == "creator" || role == "admin";
+        let creator = role == "creator";
+        if let Some(u) = ctx.store.get_user(*uid)? {
+            users.push(build_user(ctx, &u)?);
+        }
+        participants.push(if creator {
+            tl::enums::ChatParticipant::Creator(tl::types::ChatParticipantCreator {
+                user_id: *uid,
+                rank: None,
+            })
+        } else if admin {
+            tl::enums::ChatParticipant::Admin(tl::types::ChatParticipantAdmin {
+                user_id: *uid,
+                inviter_id: chat.creator_id,
+                date: chat.created_at as i32,
+                rank: None,
+            })
+        } else {
+            tl::enums::ChatParticipant::Participant(tl::types::ChatParticipant {
+                user_id: *uid,
+                inviter_id: chat.creator_id,
+                date: chat.created_at as i32,
+                rank: None,
+            })
+        });
+    }
+    let full = tl::types::ChatFull {
+        can_set_username: false,
+        has_scheduled: false,
+        translations_disabled: true,
+        id: chat.id,
+        about: String::new(),
+        participants: tl::enums::ChatParticipants::Participants(tl::types::ChatParticipants {
+            chat_id: chat.id,
+            participants,
+            version: 1,
+        }),
+        chat_photo: Some(tl::enums::Photo::Empty(tl::types::PhotoEmpty { id: 0 })),
+        notify_settings: default_notify(),
+        exported_invite: None,
+        bot_info: None,
+        pinned_msg_id: None,
+        folder_id: None,
+        call: None,
+        ttl_period: None,
+        groupcall_default_join_as: None,
+        theme_emoticon: None,
+        requests_pending: None,
+        recent_requesters: None,
+        available_reactions: None,
+        reactions_limit: None,
+    };
+    let resp = tl::types::messages::ChatFull {
+        full_chat: tl::enums::ChatFull::Full(full),
+        chats: vec![build_chat(&chat, members.len() as i32)],
+        users,
+    };
+    Ok(tl::enums::messages::ChatFull::Full(resp).to_bytes())
+}
+
+/// `messages.getPinnedDialogs` — the user's pinned dialogs.
+fn handle_get_pinned_dialogs(ctx: &RpcContext) -> Result<Vec<u8>> {
+    let rows = ctx.store.dialogs_for(ctx.user_id)?;
+    let pinned: Vec<tl::enums::Peer> = rows
+        .iter()
+        .filter(|r| r.pinned)
+        .map(|r| dialog_peer(&r.dialog_type, r.dialog_id))
+        .collect();
+    if pinned.is_empty() {
+        build_peer_dialogs(ctx, Some(&[]))
+    } else {
+        build_peer_dialogs(ctx, Some(&pinned))
+    }
+}
+
+/// `channels.getChannels` — channel peers are not implemented, so this
+/// returns an empty list rather than an error.
+fn handle_get_channels(
+    _ctx: &RpcContext,
+    _f: &tl::functions::channels::GetChannels,
+) -> Result<Vec<u8>> {
+    Ok(
+        tl::enums::messages::Chats::Chats(tl::types::messages::Chats { chats: Vec::new() })
+            .to_bytes(),
+    )
+}
+
+/// `photos.getUserPhotos` — no photo albums are stored, so return an
+/// empty, well-formed list.
+fn handle_get_user_photos(
+    _ctx: &RpcContext,
+    _f: &tl::functions::photos::GetUserPhotos,
+) -> Result<Vec<u8>> {
+    let resp = tl::types::photos::Photos {
+        photos: Vec::new(),
+        users: Vec::new(),
+    };
+    Ok(tl::enums::photos::Photos::Photos(resp).to_bytes())
+}
+
+/// `account.getNotifySettings` — read back per-peer notification settings.
+fn handle_get_notify_settings(
+    ctx: &RpcContext,
+    f: &tl::functions::account::GetNotifySettings,
+) -> Result<Vec<u8>> {
+    let peer = notify_peer_key(&f.peer);
+    let stored = ctx.store.get_notify_settings(ctx.user_id, &peer)?;
+    match stored.and_then(|j| parse_notify_settings(&j)) {
+        Some(s) => Ok(s.to_bytes()),
+        None => Ok(default_notify().to_bytes()),
+    }
+}
+
+/// `account.updateNotifySettings` — persist per-peer notification settings.
+fn handle_update_notify_settings(
+    ctx: &RpcContext,
+    f: &tl::functions::account::UpdateNotifySettings,
+) -> Result<Vec<u8>> {
+    let peer = notify_peer_key(&f.peer);
+    let json = serialize_notify_settings(&f.settings);
+    ctx.store.set_notify_settings(ctx.user_id, &peer, &json)?;
+    Ok(true.to_bytes())
+}
+
+/// `account.getAuthorizations` — the active login sessions of this user.
+fn handle_get_authorizations(ctx: &RpcContext) -> Result<Vec<u8>> {
+    let sessions = ctx.store.sessions_for_user(ctx.user_id)?;
+    let current = ctx.store.device_info(ctx.auth_key_id).ok();
+    let mut list = Vec::new();
+    for (id, _key_id, created, model, platform, api_id) in sessions {
+        let is_current = current
+            .as_ref()
+            .map(|(m, p, a)| *m == model && *p == platform && *a == api_id)
+            .unwrap_or(false);
+        let hash = hash_i64(&id);
+        list.push(tl::enums::Authorization::Authorization(
+            tl::types::Authorization {
+                current: is_current,
+                official_app: false,
+                password_pending: false,
+                encrypted_requests_disabled: false,
+                call_requests_disabled: true,
+                unconfirmed: false,
+                hash,
+                device_model: model,
+                platform,
+                system_version: String::new(),
+                api_id,
+                app_name: "Telegram".into(),
+                app_version: String::new(),
+                date_created: created as i32,
+                date_active: created as i32,
+                ip: "127.0.0.1".into(),
+                country: String::new(),
+                region: String::new(),
+            },
+        ));
+    }
+    let resp = tl::types::account::Authorizations {
+        authorization_ttl_days: 180,
+        authorizations: list,
+    };
+    Ok(tl::enums::account::Authorizations::Authorizations(resp).to_bytes())
+}
+
+/// `account.resetAuthorization` / `account.resetAuthorizations`.
+fn handle_reset_authorization(ctx: &RpcContext, hash: i64) -> Result<Vec<u8>> {
+    let sessions = ctx.store.sessions_for_user(ctx.user_id)?;
+    let target = sessions
+        .iter()
+        .find(|(id, _, _, _, _, _)| hash_i64(id) == hash)
+        .map(|(id, _, _, _, _, _)| id.clone());
+    match target {
+        Some(id) => {
+            ctx.store.drop_session(ctx.user_id, &id)?;
+            Ok(true.to_bytes())
+        }
+        None => bail_rpc(400, "AUTH_HASH_INVALID"),
+    }
+}
+
+/// `upload.getFile` — serve a previously uploaded blob, in chunks.
+fn handle_upload_get_file(ctx: &RpcContext, f: &tl::functions::upload::GetFile) -> Result<Vec<u8>> {
+    let blob_id = file_location_key(&f.location);
+    let data = match blob_id
+        .as_deref()
+        .and_then(|k| ctx.store.get_blob(k).ok().flatten())
+    {
+        Some(d) => d,
+        None => {
+            return Ok(tl::enums::upload::File::File(tl::types::upload::File {
+                r#type: tl::enums::storage::FileType::FileUnknown,
+                mtime: now() as i32,
+                bytes: Vec::new(),
+            })
+            .to_bytes());
+        }
+    };
+    let offset = f.offset.max(0) as usize;
+    let limit = f.limit.clamp(1, 1 << 20) as usize;
+    let end = (offset + limit).min(data.len());
+    let bytes = if offset < data.len() {
+        data[offset..end].to_vec()
+    } else {
+        Vec::new()
+    };
+    Ok(tl::enums::upload::File::File(tl::types::upload::File {
+        r#type: guess_file_type(&data),
+        mtime: now() as i32,
+        bytes,
+    })
+    .to_bytes())
+}
+
+/// `help.getAppConfig` — minimal, well-formed client configuration.
+fn handle_get_app_config(ctx: &RpcContext) -> Result<Vec<u8>> {
+    let values: Vec<tl::enums::JsonobjectValue> = Vec::new();
+    let json = tl::enums::Jsonvalue::JsonObject(tl::types::JsonObject { value: values });
+    let resp = tl::types::help::AppConfig {
+        hash: 1,
+        config: json,
+    };
+    let _ = ctx;
+    Ok(tl::enums::help::AppConfig::Config(resp).to_bytes())
+}
+
+/// `help.getSupport` — the server operator as the support contact.
+fn handle_get_support(ctx: &RpcContext) -> Result<Vec<u8>> {
+    let admin = ctx
+        .store
+        .all_users()?
+        .into_iter()
+        .find(|u| u.admin)
+        .or_else(|| ctx.store.get_user(ctx.user_id).ok().flatten())
+        .ok_or_else(|| anyhow!("no support user"))?;
+    let resp = tl::types::help::Support {
+        phone_number: admin.phone.clone(),
+        user: build_user(ctx, &admin)?,
+    };
+    Ok(tl::enums::help::Support::Support(resp).to_bytes())
+}
+
+/// `channels.getParticipants` — no channels exist, so report empty.
+fn handle_get_participants(
+    _ctx: &RpcContext,
+    _f: &tl::functions::channels::GetParticipants,
+) -> Result<Vec<u8>> {
+    let resp = tl::types::channels::ChannelParticipants {
+        count: 0,
+        participants: Vec::new(),
+        chats: Vec::new(),
+        users: Vec::new(),
+    };
+    Ok(tl::enums::channels::ChannelParticipants::Participants(resp).to_bytes())
+}
+
+// ------------------------------------------------------------ small helpers
+
+fn hash_i64(s: &str) -> i64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    s.hash(&mut h);
+    h.finish() as i64
+}
+
+fn notify_peer_key(p: &tl::enums::InputNotifyPeer) -> String {
+    use tl::enums::InputNotifyPeer as N;
+    match p {
+        N::Peer(x) => match resolve_peer(&x.peer) {
+            Ok((k, _)) if k == "self" => "user:0".into(),
+            Ok((k, id)) => format!("{k}:{id}"),
+            Err(_) => "unknown".into(),
+        },
+        N::InputNotifyUsers => "all:users".into(),
+        N::InputNotifyChats => "all:chats".into(),
+        N::InputNotifyBroadcasts => "all:broadcasts".into(),
+        N::InputNotifyForumTopic(_) => "all:forum".into(),
+    }
+}
+
+fn serialize_notify_settings(s: &tl::enums::InputPeerNotifySettings) -> String {
+    let tl::enums::InputPeerNotifySettings::Settings(v) = s;
+    let esc = |x: &Option<String>| {
+        x.clone()
+            .unwrap_or_default()
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+    };
+    format!(
+        "{{\"show_previews\":{},\"silent\":{},\"mute_until\":{},\"sound\":\"{}\",\"stories_muted\":{}}}",
+        v.show_previews.unwrap_or(true),
+        v.silent.unwrap_or(false),
+        v.mute_until.unwrap_or(0),
+        esc(&None),
+        v.stories_muted.unwrap_or(false),
+    )
+}
+
+/// Parse the small JSON subset written by `serialize_notify_settings`.
+fn parse_notify_settings(j: &str) -> Option<tl::enums::PeerNotifySettings> {
+    let get_bool = |key: &str| -> Option<bool> {
+        let pat = format!("\"{key}\":");
+        let i = j.find(&pat)? + pat.len();
+        let rest = j[i..].trim_start();
+        Some(rest.starts_with("true"))
+    };
+    let get_i32 = |key: &str| -> Option<i32> {
+        let pat = format!("\"{key}\":");
+        let i = j.find(&pat)? + pat.len();
+        let rest = j[i..].trim_start();
+        let end = rest.find([',', '}']).unwrap_or(rest.len());
+        rest[..end].trim().parse().ok()
+    };
+    Some(tl::enums::PeerNotifySettings::Settings(
+        tl::types::PeerNotifySettings {
+            show_previews: Some(get_bool("show_previews").unwrap_or(true)),
+            silent: Some(get_bool("silent").unwrap_or(false)),
+            mute_until: Some(get_i32("mute_until").unwrap_or(0)),
+            ios_sound: None,
+            android_sound: None,
+            other_sound: None,
+            stories_muted: Some(get_bool("stories_muted").unwrap_or(false)),
+            stories_hide_sender: None,
+            stories_ios_sound: None,
+            stories_android_sound: None,
+            stories_other_sound: None,
+        },
+    ))
+}
+
+fn file_location_key(l: &tl::enums::InputFileLocation) -> Option<String> {
+    use tl::enums::InputFileLocation as L;
+    match l {
+        L::Location(x) => Some(format!("blob:{}", x.volume_id)),
+        L::InputDocumentFileLocation(x) => Some(format!("doc:{}", x.id)),
+        L::InputPhotoFileLocation(x) => Some(format!("photo:{}", x.id)),
+        L::InputPeerPhotoFileLocation(x) => Some(format!("peerphoto:{}", x.photo_id)),
+        _ => None,
+    }
+}
+
+fn guess_file_type(data: &[u8]) -> tl::enums::storage::FileType {
+    use tl::enums::storage::FileType as T;
+    if data.starts_with(&[0xff, 0xd8, 0xff]) {
+        T::FileJpeg
+    } else if data.starts_with(b"\x89PNG") {
+        T::FilePng
+    } else if data.starts_with(b"GIF8") {
+        T::FileGif
+    } else if data.starts_with(b"%PDF") {
+        T::FilePdf
+    } else if data.starts_with(b"ID3") || data.starts_with(&[0xff, 0xfb]) {
+        T::FileMp3
+    } else if data.len() > 12 && &data[4..8] == b"ftyp" {
+        T::FileMp4
+    } else {
+        T::FileUnknown
     }
 }
 
@@ -682,14 +1556,6 @@ fn handle_read_history(
         offset: 0,
     };
     Ok(tl::enums::messages::AffectedHistory::History(resp).to_bytes())
-}
-
-fn handle_get_full_chat(
-    ctx: &RpcContext,
-    _f: &tl::functions::messages::GetFullChat,
-) -> Result<Vec<u8>> {
-    let _ = ctx;
-    bail_rpc(400, "CHAT_FULL_UNSUPPORTED")
 }
 
 fn handle_get_state(ctx: &RpcContext) -> Result<Vec<u8>> {
@@ -1050,16 +1916,6 @@ fn resolve_peer(input: &tl::enums::InputPeer) -> Result<(String, i64)> {
         P::UserFromMessage(u) => Ok(("user".into(), u.user_id)),
         P::ChannelFromMessage(c) => Ok(("channel".into(), c.channel_id)),
         P::Empty => return bail_rpc(400, "PEER_ID_INVALID"),
-    }
-}
-
-fn input_peer_user_id(i: &tl::enums::InputUser) -> Result<i64> {
-    use tl::enums::InputUser as U;
-    match i {
-        U::User(u) => Ok(u.user_id),
-        U::Empty => return bail_rpc(400, "USER_ID_INVALID"),
-        U::FromMessage(u) => Ok(u.user_id),
-        U::UserSelf => bail_rpc(400, "USER_SELF_UNSUPPORTED"),
     }
 }
 

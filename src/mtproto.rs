@@ -1,6 +1,6 @@
 //! MTProto 2.0 authorization-key handshake, message framing and encryption.
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, bail, Result};
 use grammers_tl_types as tl;
 use grammers_tl_types::{Deserializable, Serializable};
 use num_bigint::{BigInt, BigUint, RandBigInt};

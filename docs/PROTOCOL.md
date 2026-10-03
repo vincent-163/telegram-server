@@ -31,31 +31,58 @@ client/server authorization keys and nonce hashes.
 
 ## RPC namespaces
 
-Implemented namespaces and representative methods:
+The server implements the transport, handshake and state layer for real, and
+then answers the remaining MTProto method surface with protocol-valid default
+objects so that official clients can boot and exercise their full UI.
 
-| Namespace | Implemented |
+### Hand-written handlers
+
+These methods read and write actual server state:
+
+| Namespace | Handlers |
 |---|---|
-| `help` | `getConfig`, `getNearestDc` |
-| `auth` | `sendCode`, `signIn`; `signUp` explicitly disabled |
-| `users` | `getUsers`; `getFullUser` returns an explicit unsupported error |
-| `account` | `updateProfile` |
-| `messages` | `getDialogs`, `getHistory`, `sendMessage`, `editMessage`, `deleteMessages`, `readHistory`, `getChats`, `getFullChat`, `getState` |
+| `help` | `getConfig`, `getNearestDc`, `getAppConfig`, `getSupport` |
+| `auth` | `sendCode`, `signIn`; `signUp` is explicitly rejected |
+| `users` | `getUsers`, `getFullUser` |
+| `account` | `updateProfile`, `getNotifySettings`, `updateNotifySettings`, `getAuthorizations`, `resetAuthorization`, `resetAuthorizations` |
+| `messages` | `getDialogs`, `getPinnedDialogs`, `getPeerDialogs`, `getHistory`, `getMessages`, `search`, `sendMessage`, `editMessage`, `deleteMessages`, `readHistory`, `getChats`, `getFullChat`, `getPeerSettings`, `getCommonChats`, `createChat` |
+| `contacts` | `getContacts`, `importContacts`, `resetSaved`, `resolveUsername`, `search` |
 | `updates` | `getState`, `getDifference` |
-| `upload` | `saveFilePart`, `saveBigFilePart` |
-| `contacts` | `getContacts`, `importContacts`, `resetSaved` |
+| `upload` | `saveFilePart`, `saveBigFilePart`, `getFile` |
+| `channels` | `getChannels`, `getParticipants` |
+| `photos` | `getUserPhotos` |
 | `langpack` | `getLanguages`, `getDifference`, `getLanguage` |
 | containers | `invokeWithLayer`, `invokeWithoutUpdates`, `initConnection`, `msgs_ack`, `msg_container` |
 | `ping` | `ping` |
 
-Unsupported methods return an RPC error containing the generated TL method name
-instead of silently succeeding.
+### Generated compatibility surface
 
-## Deliberate boundaries
+`src/compat.rs` is generated from the `grammers-tl-types` schema by
+`tools/gen_compat.py`. It maps 660 method constructor ids to a minimal,
+protocol-valid TL literal of each method's declared return type, which lets a
+stock client complete login and render its full interface even for features
+this single-node server does not model.
 
-- Payments are not implemented.
-- SMS/phone delivery is not implemented; login codes are configured locally.
+Correctness of that table is enforced by `tests/compat.rs`: every entry is
+parsed back with `grammers-tl-types`' own deserializer for the declared return
+type, and the parse must consume the body exactly. Any entry that is not valid
+TL fails the test.
+
+### Deliberate boundaries
+
+Six namespaces are *not* stubbed, so clients receive a normal RPC error for
+them rather than a plausible-looking empty success:
+
+- `payments`, `premium`, `fragment` — they move real money.
+- `phone`, `smsjobs` — they need telephony infrastructure.
+- `aicompose` — needs a hosted model.
+
+In addition:
+
+- SMS/phone delivery is not implemented; login codes are configured locally
+  with `--login-code`.
 - Phone calls are not implemented.
-- Account registration is administrator-only.
+- Account registration is administrator-only; `auth.signUp` is rejected.
 - External Telegram CDN/config fetching is not used; the deployment serves a
   self-contained DC configuration.
 

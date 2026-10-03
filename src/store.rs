@@ -490,6 +490,31 @@ impl Store {
         Ok(out)
     }
 
+    /// Chats that both users are members of.
+    pub fn chat_members_shared(&self, a: i64, b: i64) -> Result<Vec<ChatRow>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare_cached(
+            "SELECT c.id,c.title,c.username,c.creator_id,c.created_at FROM chats c
+             JOIN chat_members ma ON ma.chat_id = c.id AND ma.user_id = ?1
+             JOIN chat_members mb ON mb.chat_id = c.id AND mb.user_id = ?2
+             ORDER BY c.id",
+        )?;
+        let rows = stmt.query_map(params![a, b], |row| {
+            Ok(ChatRow {
+                id: row.get(0)?,
+                title: row.get(1)?,
+                username: row.get(2)?,
+                creator_id: row.get(3)?,
+                created_at: row.get(4)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
     pub fn is_chat_member(&self, chat_id: i64, user_id: i64) -> Result<bool> {
         let conn = self.conn();
         let n: i64 = conn.query_row(
@@ -705,6 +730,223 @@ impl Store {
             params![kind, dialog_id],
             |r| r.get::<_, i64>(0),
         )?)
+    }
+
+    /// Full-text search over message bodies, optionally restricted to one
+    /// dialog and/or one sender.
+    pub fn search_messages(
+        &self,
+        kind: Option<&str>,
+        dialog_id: Option<i64>,
+        sender_id: Option<i64>,
+        query: &str,
+        limit: i32,
+        offset_id: i32,
+    ) -> Result<Vec<MessageRow>> {
+        let conn = self.conn();
+        let limit = limit.clamp(1, 500);
+        let pattern = format!("%{}%", query.replace('%', "\\%").replace('_', "\\_"));
+        let mut stmt = conn.prepare_cached(
+            "SELECT id,dialog_type,dialog_id,sender_id,sender_chat_id,date,message,media_kind,
+                    media_file_id,edited,reply_to,random_id
+             FROM messages WHERE deleted = 0
+                AND (?1 = '' OR dialog_type = ?1)
+                AND (?2 = 0 OR dialog_id = ?2)
+                AND (?3 = 0 OR sender_id = ?3)
+                AND (?4 = 0 OR id < ?4)
+                AND message LIKE ?5 ESCAPE '\\'
+             ORDER BY date DESC, id DESC LIMIT ?6",
+        )?;
+        let rows = stmt.query_map(
+            params![
+                kind.unwrap_or(""),
+                dialog_id.unwrap_or(0),
+                sender_id.unwrap_or(0),
+                offset_id,
+                pattern,
+                limit
+            ],
+            |r| {
+                message_from_row(r).map_err(|e| {
+                    rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(
+                        e.to_string(),
+                    )))
+                })
+            },
+        )?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    /// Total number of live messages in one dialog.
+    pub fn dialog_message_count(&self, kind: &str, dialog_id: i64) -> Result<i32> {
+        Ok(self.message_count(kind, dialog_id)? as i32)
+    }
+
+    /// Messages newer than `min_id` in one dialog, oldest first.
+    pub fn messages_after(
+        &self,
+        kind: &str,
+        dialog_id: i64,
+        min_id: i32,
+    ) -> Result<Vec<MessageRow>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare_cached(
+            "SELECT id,dialog_type,dialog_id,sender_id,sender_chat_id,date,message,media_kind,
+                    media_file_id,edited,reply_to,random_id
+             FROM messages WHERE dialog_type = ?1 AND dialog_id = ?2 AND deleted = 0 AND id > ?3
+             ORDER BY id ASC",
+        )?;
+        let rows = stmt.query_map(params![kind, dialog_id, min_id], |r| {
+            message_from_row(r).map_err(|e| {
+                rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(
+                    e.to_string(),
+                )))
+            })
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    // ------------------------------------------------------- login sessions
+
+    /// Active authorization sessions for one user, newest first.
+    pub fn sessions_for_user(
+        &self,
+        user_id: i64,
+    ) -> Result<Vec<(String, i64, i64, String, String, i32)>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare_cached(
+            "SELECT id,auth_key_id,created_at,device_model,platform,api_id
+             FROM auth_sessions WHERE user_id = ?1 ORDER BY created_at DESC",
+        )?;
+        let rows = stmt.query_map(params![user_id], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, i32>(5)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    pub fn drop_session(&self, user_id: i64, session_id: &str) -> Result<bool> {
+        let conn = self.conn();
+        let n = conn.execute(
+            "DELETE FROM auth_sessions WHERE user_id = ?1 AND id = ?2",
+            params![user_id, session_id],
+        )?;
+        Ok(n > 0)
+    }
+
+    pub fn drop_all_sessions(&self, user_id: i64, keep: Option<&str>) -> Result<usize> {
+        let conn = self.conn();
+        let n = match keep {
+            Some(id) => conn.execute(
+                "DELETE FROM auth_sessions WHERE user_id = ?1 AND id != ?2",
+                params![user_id, id],
+            )?,
+            None => conn.execute(
+                "DELETE FROM auth_sessions WHERE user_id = ?1",
+                params![user_id],
+            )?,
+        };
+        Ok(n)
+    }
+
+    pub fn count_sessions(&self, user_id: i64) -> Result<i32> {
+        let conn = self.conn();
+        Ok(conn.query_row(
+            "SELECT COUNT(*) FROM auth_sessions WHERE user_id = ?1",
+            params![user_id],
+            |r| r.get::<_, i32>(0),
+        )?)
+    }
+
+    // ------------------------------------------------- notify settings
+
+    /// Per-peer notification settings, stored as an opaque JSON payload.
+    pub fn get_notify_settings(&self, user_id: i64, peer: &str) -> Result<Option<String>> {
+        self.setting(&format!("notify:{user_id}:{peer}"))
+    }
+
+    pub fn set_notify_settings(&self, user_id: i64, peer: &str, json: &str) -> Result<()> {
+        self.set_setting(&format!("notify:{user_id}:{peer}"), json)
+    }
+
+    /// Per-peer notification settings for every peer the user touched.
+    pub fn all_notify_settings(&self, user_id: i64) -> Result<Vec<(String, String)>> {
+        let conn = self.conn();
+        let prefix = format!("notify:{user_id}:");
+        let mut stmt =
+            conn.prepare_cached("SELECT key,value FROM settings WHERE key LIKE ?1 ESCAPE '\\'")?;
+        let rows = stmt.query_map(params![format!("{prefix}%")], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            let (key, value) = r?;
+            if let Some(peer) = key.strip_prefix(&prefix) {
+                out.push((peer.to_string(), value));
+            }
+        }
+        Ok(out)
+    }
+
+    // --------------------------------------------------------- upload blobs
+
+    /// Blob id sequence used by `upload.saveFilePart` / `upload.getFile`.
+    pub fn next_blob_id(&self) -> Result<i64> {
+        let conn = self.conn();
+        let cur: Option<String> = conn
+            .query_row(
+                "SELECT value FROM settings WHERE key = 'next_blob_id'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let next = cur.and_then(|v| v.parse::<i64>().ok()).unwrap_or(1);
+        conn.execute(
+            "INSERT OR REPLACE INTO settings(key,value) VALUES('next_blob_id',?1)",
+            params![(next + 1).to_string()],
+        )?;
+        Ok(next)
+    }
+
+    pub fn put_blob(&self, id: &str, name: &str, mime: &str, data: &[u8]) -> Result<()> {
+        self.put_file(id, name, mime, data, "")
+    }
+
+    pub fn get_blob(&self, id: &str) -> Result<Option<Vec<u8>>> {
+        Ok(self.get_file(id)?.map(|(_, _, data)| data))
+    }
+
+    pub fn blob_size(&self, id: &str) -> Result<Option<i64>> {
+        let conn = self.conn();
+        let row: Option<i64> = conn
+            .query_row("SELECT size FROM files WHERE id = ?1", params![id], |r| {
+                r.get(0)
+            })
+            .optional()?;
+        Ok(row)
+    }
+
+    /// Sticker sets known to this server (empty by default).
+    pub fn sticker_sets(&self) -> Result<Vec<String>> {
+        Ok(Vec::new())
     }
 
     // ------------------------------------------------------------- files

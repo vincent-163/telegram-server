@@ -1,4 +1,4 @@
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{bail, Context, Result};
 use grammers_tl_types::{Deserializable, Serializable};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};

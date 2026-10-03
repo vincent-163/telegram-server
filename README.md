@@ -13,10 +13,22 @@ operations, and an HTTP Bot API.
 - TCP transports: abridged, intermediate, padded intermediate, full, and obfuscated.
 - SQLite persistence for users, auth keys, sessions, dialogs, messages, files, updates, and bot updates.
 - Administrative account and bot creation with self-registration disabled.
-- Core RPC groups: `ping`, `help`, `auth`, `users`, `account`, `messages`, `updates`, `upload`, `contacts`, `langpack`, and containers.
+- Hand-written RPC handlers for `ping`, `help`, `auth`, `users`, `account`,
+  `messages`, `contacts`, `updates`, `upload`, `channels`, `photos`,
+  `langpack`, and the invoke/container wrappers.
+- A generated compatibility surface (`src/compat.rs`) that answers the
+  remaining 660 MTProto methods with protocol-valid default objects, so stock
+  clients can boot and render their full UI. Every entry is round-tripped
+  through `grammers-tl-types`' deserializers in `tests/compat.rs`.
+- Six namespaces are deliberately not stubbed and return a normal RPC error:
+  `payments`, `premium`, `fragment` (real money), `phone`, `smsjobs`
+  (telephony) and `aicompose` (hosted model).
 - HTTP Bot API methods: `getMe`, `sendMessage`, `sendPhoto`, `sendDocument`, `getUpdates`, `getChat`, `sendChatAction`, `setWebhook`, `deleteWebhook`, `setMyCommands`, and `deleteMyCommands`.
 - Public endpoint exposing the configured server IP/port and MTProto RSA public key.
-- No payments, SMS delivery, or phone calls. Accounts are provisioned by an administrator.
+- No payments, premium, SMS delivery, or phone calls. Accounts are provisioned
+  by an administrator and `auth.signUp` is rejected.
+- Regenerate the compatibility table with
+  `python3 tools/gen_compat.py target/debug/build/grammers-tl-types-*/out`.
 
 A method-level compatibility inventory is maintained in
 [`docs/PROTOCOL.md`](docs/PROTOCOL.md).

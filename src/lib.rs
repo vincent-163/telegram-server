@@ -1,6 +1,7 @@
 //! A standalone, single-node Telegram server implementation in Rust.
 
 pub mod botapi;
+pub mod compat;
 pub mod config;
 pub mod connection;
 pub mod crypto;
