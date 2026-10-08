@@ -64,7 +64,7 @@ fn process_plain(state: &AppState, payload: &[u8]) -> Result<Vec<u8>> {
     let response_body = match ctor {
         0x60469778 | 0xbe7e8ef1 => {
             let request = grammers_tl_types::functions::ReqPqMulti::deserialize(
-                &mut grammers_tl_types::Cursor::from_slice(&plain.body),
+                &mut grammers_tl_types::Cursor::from_slice(&plain.body[4..]),
             )?;
             let mut handshake = Handshake::new(request.nonce);
             let response = handshake.step1(&state.rsa)?.to_bytes();
@@ -77,7 +77,7 @@ fn process_plain(state: &AppState, payload: &[u8]) -> Result<Vec<u8>> {
         }
         0xd712e4be => {
             let request = grammers_tl_types::functions::ReqDhParams::deserialize(
-                &mut grammers_tl_types::Cursor::from_slice(&plain.body),
+                &mut grammers_tl_types::Cursor::from_slice(&plain.body[4..]),
             )?;
             let mut handshakes = state.http_mtproto.handshakes.lock();
             let handshake = handshakes
@@ -87,7 +87,7 @@ fn process_plain(state: &AppState, payload: &[u8]) -> Result<Vec<u8>> {
         }
         0xf5045f1f => {
             let request = grammers_tl_types::functions::SetClientDhParams::deserialize(
-                &mut grammers_tl_types::Cursor::from_slice(&plain.body),
+                &mut grammers_tl_types::Cursor::from_slice(&plain.body[4..]),
             )?;
             let nonce = request.nonce;
             let mut handshakes = state.http_mtproto.handshakes.lock();

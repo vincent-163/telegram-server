@@ -600,7 +600,8 @@ impl PlainMessage {
 }
 
 /// Generate a server message id: high 32 bits are wall-clock seconds, low 32
-/// bits encode the sequence and response flag.
+/// bits encode the sequence. Message ids must remain divisible by four for
+/// both plain and encrypted MTProto packets.
 pub struct MsgIdGen {
     counter: u32,
 }
@@ -610,13 +611,13 @@ impl MsgIdGen {
         MsgIdGen { counter: 1 }
     }
 
-    pub fn next(&mut self, response: bool) -> i64 {
+    pub fn next(&mut self, _response: bool) -> i64 {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs() as u32)
             .unwrap_or(0);
         self.counter = self.counter.wrapping_add(4);
-        let low = (self.counter & !3) | if response { 1 } else { 0 };
+        let low = self.counter & !3;
         ((now as i64) << 32) | (low as i64)
     }
 }
