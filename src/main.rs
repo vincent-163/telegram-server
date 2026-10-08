@@ -158,9 +158,9 @@ fn load_or_create_rsa_key(path: &std::path::Path) -> Result<RsaKeyPair> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .init();
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    tracing_subscriber::fmt().with_env_filter(filter).init();
     let matches = server_command().get_matches();
     let cfg = Arc::new(config_from(&matches)?);
     let store = Store::open(&cfg.db_path).context("open database")?;
