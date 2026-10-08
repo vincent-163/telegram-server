@@ -13,6 +13,7 @@ use crate::store::{now, MessageRow, Store, UserRow};
 
 const MSG_CONTAINER: u32 = 0x73f1_f8dc;
 const HTTP_WAIT: u32 = 0x9299_359f;
+const NEW_SESSION_CREATED: u32 = 0x9ec2_0908;
 
 pub struct RpcContext {
     pub store: Store,
@@ -1349,7 +1350,10 @@ pub fn as_rpc_error(err: &anyhow::Error) -> Option<&RpcError> {
 pub fn dispatch_replies(ctx: &mut RpcContext, body: &[u8], msg_id: i64) -> Vec<RpcReply> {
     if ctor_of(body) != MSG_CONTAINER {
         if ctor_of(body) == HTTP_WAIT {
-            return Vec::new();
+            return vec![RpcReply {
+                req_msg_id: msg_id,
+                body: new_session_created(msg_id),
+            }];
         }
         log_request_constructor(msg_id, body, "single");
         return frame_reply(ctx, msg_id, body).into_iter().collect();
@@ -1372,6 +1376,15 @@ pub fn dispatch_replies(ctx: &mut RpcContext, body: &[u8], msg_id: i64) -> Vec<R
             body: framed_error(msg_id, &error, body),
         }],
     }
+}
+
+fn new_session_created(first_msg_id: i64) -> Vec<u8> {
+    let mut body = Vec::with_capacity(28);
+    body.extend_from_slice(&NEW_SESSION_CREATED.to_le_bytes());
+    body.extend_from_slice(&first_msg_id.to_le_bytes());
+    body.extend_from_slice(&(now() as i64).to_le_bytes());
+    body.extend_from_slice(&0i64.to_le_bytes());
+    body
 }
 
 fn log_request_constructor(msg_id: i64, body: &[u8], shape: &'static str) {

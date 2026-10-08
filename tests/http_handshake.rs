@@ -46,6 +46,7 @@ const PING: [u8; 4] = 0x7abe_77ecu32.to_le_bytes();
 const HTTP_WAIT: [u8; 4] = 0x9299_359fu32.to_le_bytes();
 const RPC_RESULT: u32 = 0xf35c_6d01;
 const MSG_CONTAINER: u32 = 0x73f1_f8dc;
+const NEW_SESSION_CREATED: u32 = 0x9ec2_0908;
 
 fn container(messages: &[(i64, &[u8])]) -> Vec<u8> {
     let mut body = MSG_CONTAINER.to_le_bytes().to_vec();
@@ -134,6 +135,31 @@ fn http_container_rpc_results_use_inner_message_ids() {
     assert_eq!(req_msg_id(&envelope.body), config_msg_id);
     // The `http_wait` must not turn into a second, uncorrelatable reply.
     tl::enums::Config::from_bytes(&envelope.body[12..]).expect("getConfig result must parse");
+}
+
+/// tweb treats an empty HTTP keepalive response as a transport failure. A
+/// standalone `http_wait` therefore needs a service message it can process,
+/// while container members remain skipped to avoid duplicate keepalives.
+#[test]
+fn http_wait_single_request_receives_new_session() {
+    let (state, _dir) = fixture();
+    let key = [0x33u8; 256];
+    setup_auth_key(&state, &key);
+
+    let request_msg_id = 0x3000i64;
+    let request = encrypted_request(&key, 11, request_msg_id, &HTTP_WAIT);
+    let response = http_mtproto::process(&state, &request).unwrap();
+    let envelope = EncryptedEnvelope::decode(&response, &key).unwrap();
+
+    assert_eq!(envelope.seq_no, 1);
+    assert_eq!(
+        u32::from_le_bytes(envelope.body[0..4].try_into().unwrap()),
+        NEW_SESSION_CREATED
+    );
+    assert_eq!(
+        i64::from_le_bytes(envelope.body[4..12].try_into().unwrap()),
+        request_msg_id
+    );
 }
 
 /// Two answered requests must be batched into a real `msg_container`, with
