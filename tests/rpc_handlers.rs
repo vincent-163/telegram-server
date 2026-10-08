@@ -69,6 +69,31 @@ fn call<F: Serializable, T: Deserializable>(ctx: &mut RpcContext, f: &F) -> T {
 }
 
 #[test]
+fn auth_send_code_accepts_registered_phone_in_international_format() {
+    let mut fx = setup();
+    let settings = tl::types::CodeSettings {
+        allow_flashcall: false,
+        current_number: false,
+        allow_app_hash: false,
+        allow_missed_call: false,
+        allow_firebase: false,
+        unknown_number: false,
+        logout_tokens: None,
+        token: None,
+        app_sandbox: None,
+    };
+    let f = tl::functions::auth::SendCode {
+        phone_number: "+1 555 000 0001".into(),
+        api_id: 2,
+        api_hash: "test".into(),
+        settings: tl::enums::CodeSettings::Settings(settings),
+    };
+    let body = dispatch(&mut fx.ctx, &f.to_bytes()).expect("registered phone must be accepted");
+    let _sent = tl::enums::auth::SentCode::deserialize(&mut tl::Cursor::from_slice(&body))
+        .expect("sendCode reply must parse");
+}
+
+#[test]
 fn users_get_full_user_returns_profile() {
     let mut fx = setup();
     let me = fx.ctx.user_id;

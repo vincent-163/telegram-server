@@ -1467,6 +1467,7 @@ fn handle_send_code(ctx: &mut RpcContext, f: &tl::functions::auth::SendCode) -> 
     let phone = normalize_phone(&f.phone_number);
     if !ctx.store.get_user_by_phone(&phone)?.is_some() && !phone.is_empty() {
         // Codes can only be issued for admin-registered accounts.
+        tracing::warn!("auth.sendCode rejected unregistered phone: {}", phone);
         return bail_rpc(400, "PHONE_NUMBER_INVALID");
     }
     let code = ctx.cfg.login_code.clone().unwrap_or_else(|| "00000".into());
