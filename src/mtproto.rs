@@ -755,6 +755,23 @@ impl EncryptedEnvelope {
     }
 }
 
+/// Decrypt `auth.bindTempAuthKey`'s encrypted inner message.
+///
+/// tweb serializes the inner object exactly like an MTProto encrypted payload,
+/// including the salt, session, message id and sequence prefix.
+pub fn decrypt_bound_key_message(
+    data: &[u8],
+    auth_key: &[u8; 256],
+    temp_auth_key_id: i64,
+) -> Result<Vec<u8>> {
+    let envelope = EncryptedEnvelope::decode(data, auth_key)?;
+    if envelope.salt != 0 || envelope.session_id <= 0 {
+        bail!("invalid bound-key payload metadata");
+    }
+    let _ = temp_auth_key_id;
+    Ok(envelope.body)
+}
+
 /// Build an `rpc_result` container for a response body.
 pub fn rpc_result(req_msg_id: i64, result: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(12 + result.len());

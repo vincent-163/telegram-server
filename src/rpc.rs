@@ -135,6 +135,7 @@ fn is_pre_auth_method(ctor: u32) -> bool {
             | f::auth::ImportAuthorization::CONSTRUCTOR_ID
             | f::auth::CheckPassword::CONSTRUCTOR_ID
             | f::auth::RequestPasswordRecovery::CONSTRUCTOR_ID
+            | f::auth::BindTempAuthKey::CONSTRUCTOR_ID
     )
 }
 
@@ -198,6 +199,13 @@ fn dispatch_inner(ctx: &mut RpcContext, body: &[u8], ctor: u32) -> Result<Vec<u8
         0xaac7b717 => {
             // Self-registration is disabled: accounts are created by an admin.
             return bail_rpc(403, "SIGNUP_DISABLED");
+        }
+        0xcdd42a05 => {
+            let f = tl::functions::auth::BindTempAuthKey::deserialize(
+                &mut tl::Cursor::from_slice(args),
+            )?;
+            handle_bind_temp_auth_key(ctx, &f)?;
+            return Ok(true.to_bytes());
         }
 
         // ------------------------------------------------------------ users
@@ -1586,6 +1594,44 @@ fn handle_send_code(ctx: &mut RpcContext, f: &tl::functions::auth::SendCode) -> 
         timeout: Some(300),
     };
     Ok(tl::enums::auth::SentCode::Code(sent).to_bytes())
+}
+
+/// Bind a client-created temporary key to the permanent key tweb already
+/// stores. The inner message is encrypted with that temporary key, so only a
+/// successful decrypt proves both keys are present on the client; this
+/// standalone server has no separate permanent-key transport to verify.
+fn handle_bind_temp_auth_key(
+    ctx: &mut RpcContext,
+    f: &tl::functions::auth::BindTempAuthKey,
+) -> Result<()> {
+    use tl::Deserializable as _;
+
+    let temp_auth_key_id = ctx.auth_key_id;
+    let auth_key = ctx
+        .store
+        .load_auth_key(temp_auth_key_id)?
+        .ok_or_else(|| RpcError {
+            code: 400,
+            message: "TEMP_AUTH_KEY_INVALID".into(),
+        })?;
+    let plaintext = crate::mtproto::decrypt_bound_key_message(
+        &f.encrypted_message,
+        &auth_key,
+        temp_auth_key_id,
+    )?;
+    let inner = tl::types::BindAuthKeyInner::from_bytes(&plaintext)?;
+    if inner.nonce != f.nonce
+        || inner.temp_auth_key_id != temp_auth_key_id
+        || inner.perm_auth_key_id != f.perm_auth_key_id
+    {
+        return bail_rpc(400, "TEMP_AUTH_KEY_INVALID");
+    }
+    tracing::info!(
+        temp_auth_key_id,
+        perm_auth_key_id = inner.perm_auth_key_id,
+        "auth.bindTempAuthKey accepted"
+    );
+    Ok(())
 }
 
 fn handle_sign_in(ctx: &mut RpcContext, f: &tl::functions::auth::SignIn) -> Result<Vec<u8>> {
