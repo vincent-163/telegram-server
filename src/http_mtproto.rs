@@ -30,11 +30,13 @@ impl HttpMtProtoState {
 
 pub async fn handle(State(state): State<AppState>, body: Bytes) -> Response {
     if body.is_empty() {
+        tracing::debug!("HTTP MTProto request body empty");
         let mut response = StatusCode::NO_CONTENT.into_response();
         add_cors(&mut response);
         return response;
     }
 
+    tracing::info!(bytes = body.len(), "HTTP MTProto request received");
     match process(&state, &body) {
         Ok(response) => {
             let mut response = response.into_response();
@@ -63,6 +65,10 @@ fn process_plain(state: &AppState, payload: &[u8]) -> Result<Vec<u8>> {
         bail!("plain MTProto body too short");
     }
     let ctor = u32::from_le_bytes(plain.body[0..4].try_into().unwrap());
+    tracing::info!(
+        constructor = format_args!("{ctor:#010x}"),
+        "plain MTProto request"
+    );
     let response_body = match ctor {
         0x60469778 | 0xbe7e8ef1 => {
             let request = grammers_tl_types::functions::ReqPqMulti::deserialize(
@@ -112,6 +118,7 @@ fn process_plain(state: &AppState, payload: &[u8]) -> Result<Vec<u8>> {
 
 fn process_encrypted(state: &AppState, payload: &[u8]) -> Result<Vec<u8>> {
     let key_id = i64::from_le_bytes(payload[0..8].try_into().unwrap());
+    tracing::info!(key_id, bytes = payload.len(), "encrypted MTProto request");
     let Some(key) = state.store.load_auth_key(key_id)? else {
         return Ok((-404i32).to_le_bytes().to_vec());
     };

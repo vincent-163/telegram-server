@@ -1348,22 +1348,59 @@ pub fn as_rpc_error(err: &anyhow::Error) -> Option<&RpcError> {
 /// transport response is what settles it.
 pub fn dispatch_replies(ctx: &mut RpcContext, body: &[u8], msg_id: i64) -> Vec<RpcReply> {
     if ctor_of(body) != MSG_CONTAINER {
+        log_request_constructor(msg_id, ctor_of(body), "single");
         return frame_reply(ctx, msg_id, body).into_iter().collect();
     }
     match parse_container(body) {
-        Ok(messages) => messages
-            .into_iter()
-            .filter_map(|(inner_msg_id, inner)| {
-                if ctor_of(&inner) == HTTP_WAIT {
-                    return None;
-                }
-                frame_reply(ctx, inner_msg_id, &inner)
-            })
-            .collect(),
+        Ok(messages) => {
+            log_batched_requests(msg_id, &messages);
+            messages
+                .into_iter()
+                .filter_map(|(inner_msg_id, inner)| {
+                    if ctor_of(&inner) == HTTP_WAIT {
+                        return None;
+                    }
+                    frame_reply(ctx, inner_msg_id, &inner)
+                })
+                .collect()
+        }
         Err(error) => vec![RpcReply {
             req_msg_id: msg_id,
             body: framed_error(msg_id, &error, body),
         }],
+    }
+}
+
+fn log_request_constructor(msg_id: i64, ctor: u32, shape: &'static str) {
+    tracing::info!(
+        msg_id,
+        shape,
+        constructor = format_args!("{ctor:#010x}"),
+        method = request_method_name(ctor),
+        "MTProto RPC request"
+    );
+}
+
+fn log_batched_requests(msg_id: i64, messages: &[(i64, Vec<u8>)]) {
+    tracing::info!(
+        msg_id,
+        count = messages.len(),
+        methods = ?messages
+            .iter()
+            .map(|(inner_msg_id, body)| (*inner_msg_id, request_method_name(ctor_of(body))))
+            .collect::<Vec<_>>(),
+        "MTProto RPC request batch"
+    );
+}
+
+fn request_method_name(ctor: u32) -> &'static str {
+    match ctor {
+        0xc4f9_186b => "help.getConfig",
+        0xa677_244f => "auth.sendCode",
+        0x8d52_a951 => "auth.signIn",
+        HTTP_WAIT => "http.wait",
+        MSG_CONTAINER => "msg_container",
+        _ => "other",
     }
 }
 
