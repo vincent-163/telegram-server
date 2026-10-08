@@ -1348,7 +1348,7 @@ pub fn as_rpc_error(err: &anyhow::Error) -> Option<&RpcError> {
 /// transport response is what settles it.
 pub fn dispatch_replies(ctx: &mut RpcContext, body: &[u8], msg_id: i64) -> Vec<RpcReply> {
     if ctor_of(body) != MSG_CONTAINER {
-        log_request_constructor(msg_id, ctor_of(body), "single");
+        log_request_constructor(msg_id, body, "single");
         return frame_reply(ctx, msg_id, body).into_iter().collect();
     }
     match parse_container(body) {
@@ -1371,12 +1371,13 @@ pub fn dispatch_replies(ctx: &mut RpcContext, body: &[u8], msg_id: i64) -> Vec<R
     }
 }
 
-fn log_request_constructor(msg_id: i64, ctor: u32, shape: &'static str) {
+fn log_request_constructor(msg_id: i64, body: &[u8], shape: &'static str) {
+    let ctor = request_ctor(body);
     tracing::info!(
         msg_id,
         shape,
         constructor = format_args!("{ctor:#010x}"),
-        method = request_method_name(ctor),
+        method = request_method_name(body),
         "MTProto RPC request"
     );
 }
@@ -1387,13 +1388,14 @@ fn log_batched_requests(msg_id: i64, messages: &[(i64, Vec<u8>)]) {
         count = messages.len(),
         methods = ?messages
             .iter()
-            .map(|(inner_msg_id, body)| (*inner_msg_id, request_method_name(ctor_of(body))))
+            .map(|(inner_msg_id, body)| (*inner_msg_id, request_method_name(body)))
             .collect::<Vec<_>>(),
         "MTProto RPC request batch"
     );
 }
 
-fn request_method_name(ctor: u32) -> &'static str {
+fn request_method_name(body: &[u8]) -> &'static str {
+    let ctor = request_ctor(body);
     match ctor {
         0xc4f9_186b => "help.getConfig",
         0xa677_244f => "auth.sendCode",
@@ -1402,6 +1404,54 @@ fn request_method_name(ctor: u32) -> &'static str {
         MSG_CONTAINER => "msg_container",
         _ => "other",
     }
+}
+
+fn request_ctor(body: &[u8]) -> u32 {
+    let mut body = body;
+    loop {
+        let ctor = ctor_of(body);
+        match ctor {
+            0xda9b_0d0d => {
+                if body.len() < 8 {
+                    return ctor;
+                }
+                body = &body[8..];
+            }
+            0xbf94_59b7 => {
+                if body.len() < 4 {
+                    return ctor;
+                }
+                body = &body[4..];
+            }
+            0xc1cd_5ea9 => match init_connection_query_offset(body) {
+                Ok(offset) if offset < body.len() => body = &body[offset..],
+                _ => return ctor,
+            },
+            _ => return ctor,
+        }
+    }
+}
+
+fn init_connection_query_offset(body: &[u8]) -> Result<usize> {
+    if body.len() < 8 {
+        bail!("initConnection too short");
+    }
+    let mut off = 4usize;
+    let flags = read_i32(body, &mut off)?;
+    let _api_id = read_i32(body, &mut off)?;
+    let _device_model = read_string(body, &mut off)?;
+    let _system_version = read_string(body, &mut off)?;
+    let _app_version = read_string(body, &mut off)?;
+    let _system_lang = read_string(body, &mut off)?;
+    let _lang_pack = read_string(body, &mut off)?;
+    let _lang_code = read_string(body, &mut off)?;
+    if flags & 1 != 0 {
+        skip_value(body, &mut off)?;
+    }
+    if flags & 2 != 0 {
+        skip_value(body, &mut off)?;
+    }
+    Ok(off)
 }
 
 /// Turn dispatched replies into the single message body to put on the wire.
@@ -1509,6 +1559,7 @@ fn handle_send_code(ctx: &mut RpcContext, f: &tl::functions::auth::SendCode) -> 
     }
     let code = ctx.cfg.login_code.clone().unwrap_or_else(|| "00000".into());
     ctx.store.issue_login_code(&phone, &code, 300)?;
+    tracing::info!(phone, "auth.sendCode accepted");
     let sent = tl::types::auth::SentCode {
         r#type: tl::enums::auth::SentCodeType::App(tl::types::auth::SentCodeTypeApp { length: 5 }),
         phone_code_hash: hash_for(&phone),
