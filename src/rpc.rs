@@ -8,7 +8,11 @@ use std::sync::Arc;
 
 use crate::compat;
 use crate::config::Config;
+use crate::mtproto::{msg_container, rpc_error, rpc_result, MsgIdGen, SeqNoGen};
 use crate::store::{now, MessageRow, Store, UserRow};
+
+const MSG_CONTAINER: u32 = 0x73f1_f8dc;
+const HTTP_WAIT: u32 = 0x929c_9539;
 
 pub struct RpcContext {
     pub store: Store,
@@ -16,6 +20,12 @@ pub struct RpcContext {
     pub auth_key_id: i64,
     pub user_id: i64,
     pub layer: i32,
+}
+
+/// One reply paired with the id of the client message it answers.
+pub struct RpcReply {
+    pub req_msg_id: i64,
+    pub body: Vec<u8>,
 }
 
 impl RpcContext {
@@ -504,11 +514,6 @@ fn dispatch_inner(ctx: &mut RpcContext, body: &[u8], ctor: u32) -> Result<Vec<u8
             // msgs_ack
             return Ok(Vec::new());
         }
-        0x73f1f8dc => {
-            // msg_container: recurse over each contained message
-            return handle_container(ctx, body);
-        }
-
         _ => {
             if let Some(body) = compat::default_response(ctor) {
                 return Ok(body);
@@ -1333,32 +1338,129 @@ pub fn as_rpc_error(err: &anyhow::Error) -> Option<&RpcError> {
 
 // ---------------------------------------------------------------- helpers
 
-fn handle_container(ctx: &mut RpcContext, body: &[u8]) -> Result<Vec<u8>> {
+/// Dispatch a request message and frame every reply against the client
+/// message id it answers.
+///
+/// Batched clients put several requests inside one `msg_container`. Answering
+/// with a single `rpc_result` keyed by the container id leaves every inner
+/// deferred unresolved, so each inner message gets its own reply instead.
+/// `http_wait` is deliberately dropped: it never has a TL reply, and the
+/// transport response is what settles it.
+pub fn dispatch_replies(ctx: &mut RpcContext, body: &[u8], msg_id: i64) -> Vec<RpcReply> {
+    if ctor_of(body) != MSG_CONTAINER {
+        return frame_reply(ctx, msg_id, body).into_iter().collect();
+    }
+    match parse_container(body) {
+        Ok(messages) => messages
+            .into_iter()
+            .filter_map(|(inner_msg_id, inner)| {
+                if ctor_of(&inner) == HTTP_WAIT {
+                    return None;
+                }
+                frame_reply(ctx, inner_msg_id, &inner)
+            })
+            .collect(),
+        Err(error) => vec![RpcReply {
+            req_msg_id: msg_id,
+            body: framed_error(msg_id, &error, body),
+        }],
+    }
+}
+
+/// Turn dispatched replies into the single message body to put on the wire.
+///
+/// One reply goes out as-is. Several are packed into a `msg_container` so
+/// every inner reply keeps its own `req_msg_id`. Returns `None` when the
+/// request produced nothing to send.
+pub fn frame_replies(
+    replies: Vec<RpcReply>,
+    session_id: i64,
+    msg_ids: &mut MsgIdGen,
+    seq_nos: &mut SeqNoGen,
+) -> Option<(Vec<u8>, i32)> {
+    if replies.is_empty() {
+        return None;
+    }
+    if replies.len() == 1 {
+        let mut replies = replies;
+        let reply = replies.pop().unwrap();
+        return Some((reply.body, seq_nos.next(session_id, true)));
+    }
+    let entries: Vec<(i64, i32, Vec<u8>)> = replies
+        .into_iter()
+        .map(|reply| {
+            (
+                msg_ids.next(true),
+                seq_nos.next(session_id, true),
+                reply.body,
+            )
+        })
+        .collect();
+    let seq_no = seq_nos.next(session_id, false);
+    Some((msg_container(&entries), seq_no))
+}
+
+fn frame_reply(ctx: &mut RpcContext, req_msg_id: i64, body: &[u8]) -> Option<RpcReply> {
+    match dispatch(ctx, body) {
+        Ok(result) if result.is_empty() => None,
+        Ok(result) => Some(RpcReply {
+            req_msg_id,
+            body: rpc_result(req_msg_id, &result),
+        }),
+        Err(error) => Some(RpcReply {
+            req_msg_id,
+            body: framed_error(req_msg_id, &error, body),
+        }),
+    }
+}
+
+fn framed_error(req_msg_id: i64, error: &anyhow::Error, body: &[u8]) -> Vec<u8> {
+    let detail = match error.downcast_ref::<RpcError>() {
+        Some(rpc) => rpc_error(rpc.code, &rpc.message),
+        None => {
+            tracing::warn!(
+                "internal error handling request {:#010x}: {:#}",
+                ctor_of(body),
+                error
+            );
+            rpc_error(400, "INTERNAL_ERROR")
+        }
+    };
+    rpc_result(req_msg_id, &detail)
+}
+
+fn ctor_of(body: &[u8]) -> u32 {
+    if body.len() < 4 {
+        return 0;
+    }
+    u32::from_le_bytes(body[0..4].try_into().unwrap())
+}
+
+fn parse_container(body: &[u8]) -> Result<Vec<(i64, Vec<u8>)>> {
     let mut off = 4usize;
-    let count = read_i32(body, &mut off)? as usize;
-    let mut combined = Vec::new();
+    let count = read_i32(body, &mut off)?;
+    if count < 0 {
+        bail!("negative container count");
+    }
+    let count = count as usize;
+    // Every entry costs at least msg_id + seq_no + length: reject a count that
+    // cannot fit before reserving anything.
+    if count > body.len().saturating_sub(off) / 20 {
+        bail!("container count exceeds remaining bytes");
+    }
+    let mut messages = Vec::with_capacity(count);
     for _ in 0..count {
         let msg_id = read_i64(body, &mut off)?;
-        let _seq = read_i32(body, &mut off)?;
-        let len = read_i32(body, &mut off)? as usize;
-        if off + len > body.len() {
+        let _seq_no = read_i32(body, &mut off)?;
+        let len = read_i32(body, &mut off)?;
+        if len < 0 || (len as usize) > body.len() - off {
             bail!("container overruns buffer");
         }
-        let inner = &body[off..off + len];
+        let len = len as usize;
+        messages.push((msg_id, body[off..off + len].to_vec()));
         off += len;
-        if inner.len() < 4 {
-            continue;
-        }
-        let inner_ctor = u32::from_le_bytes(inner[0..4].try_into().unwrap());
-        if inner_ctor == 0xf35c6d01 || inner_ctor == 0xa7eff811 {
-            continue;
-        }
-        let _ = msg_id;
-        if let Ok(resp) = dispatch(ctx, inner) {
-            combined.extend_from_slice(&resp);
-        }
     }
-    Ok(combined)
+    Ok(messages)
 }
 
 fn handle_send_code(ctx: &mut RpcContext, f: &tl::functions::auth::SendCode) -> Result<Vec<u8>> {
@@ -1720,8 +1822,12 @@ pub fn build_config(ctx: &RpcContext) -> Result<tl::enums::Config> {
         message_length_max: 4096,
         webfile_dc_id: dc,
         suggested_lang_code: Some("en".into()),
-        lang_pack_version: None,
-        base_lang_pack_version: None,
+        // `suggested_lang_code`, `lang_pack_version` and
+        // `base_lang_pack_version` all share `flags.2`. Writing only the
+        // language code sets the bit while omitting the two integers that
+        // follow it, which makes the result unparsable (clients stop at EOF).
+        lang_pack_version: Some(0),
+        base_lang_pack_version: Some(0),
         reactions_default: None,
         autologin_token: None,
     }))

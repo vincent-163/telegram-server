@@ -9,12 +9,13 @@ use std::collections::HashMap;
 
 use crate::botapi::AppState;
 use crate::crypto::auth_key_id;
-use crate::mtproto::{rpc_error, rpc_result, EncryptedEnvelope, Handshake, MsgIdGen, PlainMessage};
-use crate::rpc::{dispatch, RpcContext, RpcError};
+use crate::mtproto::{EncryptedEnvelope, Handshake, MsgIdGen, PlainMessage, SeqNoGen};
+use crate::rpc::{dispatch_replies, frame_replies, RpcContext};
 
 pub struct HttpMtProtoState {
     handshakes: Mutex<HashMap<[u8; 16], Handshake>>,
     msg_ids: Mutex<MsgIdGen>,
+    seq_nos: Mutex<SeqNoGen>,
 }
 
 impl HttpMtProtoState {
@@ -22,6 +23,7 @@ impl HttpMtProtoState {
         Self {
             handshakes: Mutex::new(HashMap::new()),
             msg_ids: Mutex::new(MsgIdGen::new()),
+            seq_nos: Mutex::new(SeqNoGen::new()),
         }
     }
 }
@@ -122,26 +124,20 @@ fn process_encrypted(state: &AppState, payload: &[u8]) -> Result<Vec<u8>> {
         user_id: state.store.session_user(key_id)?.unwrap_or(0),
         layer: state.store.session_layer(key_id)?.unwrap_or(227),
     };
-    let response_body = match dispatch(&mut ctx, &envelope.body) {
-        Ok(result) if result.is_empty() => return Ok(Vec::new()),
-        Ok(result) => rpc_result(envelope.msg_id, &result),
-        Err(error) => {
-            let body = match error.downcast_ref::<RpcError>() {
-                Some(rpc) => rpc_error(rpc.code, &rpc.message),
-                None => {
-                    tracing::warn!("internal error handling HTTP MTProto request: {:#}", error);
-                    rpc_error(400, "INTERNAL_ERROR")
-                }
-            };
-            rpc_result(envelope.msg_id, &body)
-        }
+    let replies = dispatch_replies(&mut ctx, &envelope.body, envelope.msg_id);
+    let mut msg_ids = state.http_mtproto.msg_ids.lock();
+    let mut seq_nos = state.http_mtproto.seq_nos.lock();
+    let Some((body, seq_no)) =
+        frame_replies(replies, envelope.session_id, &mut msg_ids, &mut seq_nos)
+    else {
+        return Ok(Vec::new());
     };
     let response = EncryptedEnvelope {
         salt: envelope.salt,
         session_id: envelope.session_id,
-        msg_id: state.http_mtproto.msg_ids.lock().next(true),
-        seq_no: 1,
-        body: response_body,
+        msg_id: msg_ids.next(true),
+        seq_no,
+        body,
     };
     Ok(response.encode(&key))
 }

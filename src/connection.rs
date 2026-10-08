@@ -6,10 +6,8 @@ use tokio::net::{TcpListener, TcpStream};
 
 use crate::config::Config;
 use crate::crypto::auth_key_id;
-use crate::mtproto::{
-    rpc_error, rpc_result, EncryptedEnvelope, Handshake, MsgIdGen, PlainMessage, RsaKeyPair,
-};
-use crate::rpc::{dispatch, RpcContext, RpcError};
+use crate::mtproto::{EncryptedEnvelope, Handshake, MsgIdGen, PlainMessage, RsaKeyPair, SeqNoGen};
+use crate::rpc::{dispatch_replies, frame_replies, RpcContext};
 use crate::store::Store;
 use crate::transport::{Decoder, Encoder};
 
@@ -47,6 +45,7 @@ async fn handle(
     let mut handshake = Handshake::new(rand::random());
     let mut auth_key: Option<[u8; 256]> = None;
     let mut msg_ids = MsgIdGen::new();
+    let mut seq_nos = SeqNoGen::new();
     let mut read = vec![0u8; 64 * 1024];
     loop {
         let n = stream.read(&mut read).await?;
@@ -90,34 +89,16 @@ async fn handle(
                     // sent `invokeWithLayer` has its real layer persisted.
                     layer: store.session_layer(key_id)?.unwrap_or(227),
                 };
-                let response = match dispatch(&mut ctx, &env.body) {
-                    Ok(result) if result.is_empty() => Vec::new(),
-                    Ok(result) => rpc_result(env.msg_id, &result),
-                    // Errors ride inside `rpc_result` too: that is where the
-                    // client reads the request id it is waiting on.
-                    Err(e) => {
-                        let body = match e.downcast_ref::<RpcError>() {
-                            Some(re) => rpc_error(re.code, &re.message),
-                            None => {
-                                tracing::warn!(
-                                    "internal error handling {:#010x} from {}: {:#}",
-                                    ctor_of(&env.body),
-                                    peer,
-                                    e
-                                );
-                                rpc_error(400, "INTERNAL_ERROR")
-                            }
-                        };
-                        rpc_result(env.msg_id, &body)
-                    }
-                };
-                if !response.is_empty() {
+                let replies = dispatch_replies(&mut ctx, &env.body, env.msg_id);
+                if let Some((body, seq_no)) =
+                    frame_replies(replies, env.session_id, &mut msg_ids, &mut seq_nos)
+                {
                     let out_env = EncryptedEnvelope {
                         salt: env.salt,
                         session_id: env.session_id,
                         msg_id: msg_ids.next(true),
-                        seq_no: 1,
-                        body: response,
+                        seq_no,
+                        body,
                     };
                     write_frame(&mut stream, encoder.as_mut().unwrap(), &out_env.encode(key))
                         .await?;
@@ -176,13 +157,6 @@ async fn handle(
 /// `auth_key_id == 0` marks a plain message, whose declared body length is at
 /// bytes 16..20. Encrypted messages carry `auth_key_id` then a 16-byte message
 /// key, and the AES-IGE payload is always a multiple of 16.
-/// The leading constructor of a TL body, for log messages.
-fn ctor_of(body: &[u8]) -> u32 {
-    if body.len() < 4 {
-        return 0;
-    }
-    u32::from_le_bytes(body[0..4].try_into().unwrap())
-}
 
 fn trim_transport_padding(payload: &mut Vec<u8>) {
     if payload.len() < 4 {

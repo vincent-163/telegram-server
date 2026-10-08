@@ -7,6 +7,7 @@ use num_bigint::{BigInt, BigUint, RandBigInt};
 use num_integer::Integer;
 use num_traits::{One, Zero};
 use rand::Rng;
+use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::crypto::*;
@@ -620,6 +621,62 @@ impl MsgIdGen {
         let low = self.counter & !3;
         ((now as i64) << 32) | (low as i64)
     }
+}
+
+/// Server sequence numbers, tracked per MTProto session.
+///
+/// Content-related messages take the next odd value (`2n+1`) and advance the
+/// session counter; a response container is *not* content-related and takes
+/// the even value (`2n`) without advancing it. Each session keeps its own
+/// counter, because a session id change starts the client's counter over.
+///
+/// The map is capped so a client cycling session ids cannot grow it without
+/// bound. Dropping it only costs sequence continuity for sessions that stay
+/// active after this many other sessions have been seen.
+pub struct SeqNoGen {
+    counts: HashMap<i64, i32>,
+}
+
+const MAX_TRACKED_SESSIONS: usize = 4096;
+
+impl SeqNoGen {
+    pub fn new() -> Self {
+        Self {
+            counts: HashMap::new(),
+        }
+    }
+
+    pub fn next(&mut self, session_id: i64, content_related: bool) -> i32 {
+        if !self.counts.contains_key(&session_id) && self.counts.len() >= MAX_TRACKED_SESSIONS {
+            self.counts.clear();
+        }
+        let count = self.counts.entry(session_id).or_insert(0);
+        let seq_no = *count * 2;
+        if content_related {
+            *count += 1;
+            seq_no + 1
+        } else {
+            seq_no
+        }
+    }
+}
+
+/// Encode a `msg_container` of server messages.
+///
+/// Each entry is the bare `%Message` layout the wire uses: message id,
+/// sequence number, body length, body -- there is no constructor id between
+/// the container header and the entries.
+pub fn msg_container(messages: &[(i64, i32, Vec<u8>)]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&0x73f1_f8dcu32.to_le_bytes());
+    out.extend_from_slice(&(messages.len() as i32).to_le_bytes());
+    for (msg_id, seq_no, body) in messages {
+        out.extend_from_slice(&msg_id.to_le_bytes());
+        out.extend_from_slice(&seq_no.to_le_bytes());
+        out.extend_from_slice(&(body.len() as i32).to_le_bytes());
+        out.extend_from_slice(body);
+    }
+    out
 }
 
 /// An MTProto 2.0 encrypted envelope.
