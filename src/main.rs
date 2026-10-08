@@ -61,6 +61,7 @@ fn config_from(matches: &clap::ArgMatches) -> Result<Config> {
 
 fn server_command() -> Command {
     Command::new("telegram-server")
+        .version(env!("CARGO_PKG_VERSION"))
         .arg(
             Arg::new("db")
                 .long("db")
