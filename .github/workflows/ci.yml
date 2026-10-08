@@ -1,0 +1,82 @@
+name: Server CI & Release
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    name: Test and package
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout.
+        uses: actions/checkout@v4
+
+      - name: Set up Rust.
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Cache Rust build.
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting.
+        run: cargo fmt --check
+
+      - name: Run tests.
+        run: cargo test --locked --all-targets
+
+      - name: Build release binary.
+        run: cargo build --locked --release
+
+      - name: Package executable.
+        id: package
+        run: |
+          set -euo pipefail
+          version="$(cargo metadata --locked --no-deps --format-version 1 \
+            | python3 -c 'import json, sys; print(json.load(sys.stdin)["packages"][0]["version"])')"
+          test "$version" = "0.0.1"
+          name="telegram-server-${version}-linux-x64-${GITHUB_SHA::8}"
+          stage="$RUNNER_TEMP/$name"
+          mkdir -p "$stage"
+          cp target/release/telegram-server "$stage/"
+          cp README.md LICENSE "$stage/"
+          cp deploy/telegram-server.service "$stage/"
+          tar -cJf "$name.tar.xz" -C "$RUNNER_TEMP" "$name"
+          mkdir -p artifacts
+          mv "$name.tar.xz" artifacts/
+          (cd artifacts && sha256sum ./*.tar.xz > SHA256SUMS.txt)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          ls -lh artifacts
+
+      - name: Upload artifact.
+        uses: actions/upload-artifact@v4
+        with:
+          name: telegram-server-${{ github.sha }}
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Publish release.
+        if: github.event_name == 'push' && github.ref_name == github.event.repository.default_branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SERVER_VERSION: ${{ steps.package.outputs.version }}
+        run: |
+          set -euo pipefail
+          tag="v${SERVER_VERSION}-${GITHUB_SHA::8}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" artifacts/* --clobber
+          else
+            gh release create "$tag" artifacts/* \
+              --target "$GITHUB_SHA" \
+              --title "telegram-server ${SERVER_VERSION} (build ${GITHUB_SHA::8})" \
+              --notes "Linux x64 executable build of ${GITHUB_SHA}; server version ${SERVER_VERSION}." \
+              --latest
+          fi
