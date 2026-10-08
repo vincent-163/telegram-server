@@ -12,7 +12,7 @@ use crate::mtproto::{msg_container, rpc_error, rpc_result, MsgIdGen, SeqNoGen};
 use crate::store::{now, MessageRow, Store, UserRow};
 
 const MSG_CONTAINER: u32 = 0x73f1_f8dc;
-const HTTP_WAIT: u32 = 0x929c_9539;
+const HTTP_WAIT: u32 = 0x9299_359f;
 
 pub struct RpcContext {
     pub store: Store,
@@ -1348,6 +1348,9 @@ pub fn as_rpc_error(err: &anyhow::Error) -> Option<&RpcError> {
 /// transport response is what settles it.
 pub fn dispatch_replies(ctx: &mut RpcContext, body: &[u8], msg_id: i64) -> Vec<RpcReply> {
     if ctor_of(body) != MSG_CONTAINER {
+        if ctor_of(body) == HTTP_WAIT {
+            return Vec::new();
+        }
         log_request_constructor(msg_id, body, "single");
         return frame_reply(ctx, msg_id, body).into_iter().collect();
     }
@@ -1488,6 +1491,9 @@ pub fn frame_replies(
 }
 
 fn frame_reply(ctx: &mut RpcContext, req_msg_id: i64, body: &[u8]) -> Option<RpcReply> {
+    if ctor_of(body) == HTTP_WAIT {
+        return None;
+    }
     match dispatch(ctx, body) {
         Ok(result) if result.is_empty() => None,
         Ok(result) => Some(RpcReply {

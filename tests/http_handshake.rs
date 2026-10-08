@@ -43,7 +43,7 @@ fn fixture() -> (AppState, PathBuf) {
 
 const HELP_GET_CONFIG: [u8; 4] = 0xc4f9_186bu32.to_le_bytes();
 const PING: [u8; 4] = 0x7abe_77ecu32.to_le_bytes();
-const HTTP_WAIT: [u8; 4] = 0x929c_9539u32.to_le_bytes();
+const HTTP_WAIT: [u8; 4] = 0x9299_359fu32.to_le_bytes();
 const RPC_RESULT: u32 = 0xf35c_6d01;
 const MSG_CONTAINER: u32 = 0x73f1_f8dc;
 
