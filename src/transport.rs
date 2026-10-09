@@ -202,17 +202,9 @@ impl Decoder {
         rx.apply(&mut head);
         let tag = u32::from_le_bytes(head[56..60].try_into().unwrap());
         self.buf.drain(..64);
-        // The remainder arrived after the obfuscation header, so it must be
-        // decrypted with the same CTR instance.
-        let mut rest = self.buf.split_off(0);
-        if rest.is_empty() {
-            rest = Vec::new();
-        }
-        let mut tail = std::mem::take(&mut self.buf);
-        rx.apply(&mut tail);
-        let mut decrypted = tail;
-        decrypted.append(&mut rest);
-        self.buf = decrypted;
+        // Any bytes after the header arrived in the same read and continue the
+        // same CTR keystream, so decrypt them before parsing transport frames.
+        rx.apply(&mut self.buf);
         self.inbound = Some(rx);
         self.kind = Some(match tag {
             TRANSPORT_TAG_ABRIDGED => TransportKind::Abridged,
@@ -539,5 +531,34 @@ mod tests {
         assert_eq!(buf[..payload.len()], payload[..]);
         // The trailing bytes are the 0..3 transport padding.
         assert!(buf.len() - payload.len() < 4);
+    }
+
+    #[test]
+    fn obfuscated_header_and_payload_in_one_read() {
+        let init = make_obfuscation_init(TRANSPORT_TAG_PADDED_INTERMEDIATE);
+        let keys = ObfKeys::from_init(&init);
+        let mut client = Ctr::new(&keys.forward_key, &keys.forward_iv);
+        let mut header = init;
+        client.apply(&mut header);
+        let mut tail = init;
+        tail[56..64].copy_from_slice(&header[56..64]);
+
+        let payload = vec![7u8; 32];
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&((payload.len() + 5) as u32).to_le_bytes());
+        frame.extend_from_slice(&payload);
+        frame.extend_from_slice(&[0xcc; 5]);
+        client.apply(&mut frame);
+
+        let mut first_read = tail.to_vec();
+        first_read.extend_from_slice(&frame);
+        let mut dec = Decoder::new();
+        dec.push(&first_read).unwrap();
+        assert!(dec.ensure_started().unwrap());
+        assert_eq!(dec.kind(), Some(TransportKind::PaddedIntermediate));
+        assert!(dec.is_obfuscated());
+        let got = dec.next_payload().unwrap().unwrap();
+        assert_eq!(got.len(), payload.len() + 5);
+        assert!(got.starts_with(&payload));
     }
 }
