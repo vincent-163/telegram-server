@@ -1630,7 +1630,16 @@ fn handle_bind_temp_auth_key(
         temp_auth_key_id,
         perm_auth_key_id,
     )?;
-    let inner = tl::types::BindAuthKeyInner::from_bytes(&plaintext)?;
+    // Clients that hand-serialize the inner object (tweb) emit the
+    // `bind_auth_key_inner#75a3f765` constructor, while `to_bytes()` /
+    // `from_bytes()` on the generated type work on the bare fields only.
+    // Accept both, otherwise every field is silently read four bytes early.
+    let bare = if ctor_of(&plaintext) == 0x75a3_f765 && plaintext.len() >= 4 {
+        &plaintext[4..]
+    } else {
+        &plaintext[..]
+    };
+    let inner = tl::types::BindAuthKeyInner::from_bytes(bare)?;
     if inner.nonce != f.nonce
         || inner.temp_auth_key_id != temp_auth_key_id
         || inner.perm_auth_key_id != perm_auth_key_id

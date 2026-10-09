@@ -451,13 +451,15 @@ fn auth_bind_temp_auth_key_accepts_legacy_permanent_key_envelope() {
     }
     .to_bytes();
 
-    // The inner object is identical to the TL serialization, but the 1.0 body
-    // carries a random 16-byte prefix in place of salt + session_id.
+    // tweb writes the `bind_auth_key_inner#75a3f765` constructor itself, and
+    // the 1.0 body carries a random 16-byte prefix in place of salt/session.
+    let mut body = 0x75a3_f765u32.to_le_bytes().to_vec();
+    body.extend_from_slice(&inner);
     let mut plain = vec![0xABu8; 16];
     plain.extend_from_slice(&msg_id.to_le_bytes());
     plain.extend_from_slice(&0i32.to_le_bytes());
-    plain.extend_from_slice(&(inner.len() as i32).to_le_bytes());
-    plain.extend_from_slice(&inner);
+    plain.extend_from_slice(&(body.len() as i32).to_le_bytes());
+    plain.extend_from_slice(&body);
     let unpadded_len = plain.len();
     while plain.len() % 16 != 0 {
         plain.push(0xCC);
