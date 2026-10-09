@@ -1531,7 +1531,17 @@ fn frame_reply(ctx: &mut RpcContext, req_msg_id: i64, body: &[u8]) -> Option<Rpc
 
 fn framed_error(req_msg_id: i64, error: &anyhow::Error, body: &[u8]) -> Vec<u8> {
     let detail = match error.downcast_ref::<RpcError>() {
-        Some(rpc) => rpc_error(rpc.code, &rpc.message),
+        Some(rpc) => {
+            tracing::warn!(
+                req_msg_id,
+                constructor = format_args!("{:#010x}", ctor_of(body)),
+                method = request_method_name(body),
+                code = rpc.code,
+                message = %rpc.message,
+                "MTProto RPC request failed"
+            );
+            rpc_error(rpc.code, &rpc.message)
+        }
         None => {
             tracing::warn!(
                 "internal error handling request {:#010x}: {:#}",
@@ -1608,21 +1618,37 @@ fn handle_bind_temp_auth_key(
     use tl::Deserializable as _;
 
     let temp_auth_key_id = ctx.auth_key_id;
-    let temp_auth_key = ctx
-        .store
-        .load_auth_key(temp_auth_key_id)?
-        .ok_or_else(|| RpcError {
-            code: 400,
-            message: "TEMP_AUTH_KEY_INVALID".into(),
-        })?;
+    let temp_auth_key = match ctx.store.load_auth_key(temp_auth_key_id)? {
+        Some(key) => key,
+        None => {
+            tracing::warn!(
+                temp_auth_key_id,
+                perm_auth_key_id = f.perm_auth_key_id,
+                "auth.bindTempAuthKey temporary key is missing"
+            );
+            return Err(RpcError {
+                code: 400,
+                message: "TEMP_AUTH_KEY_INVALID".into(),
+            }
+            .into());
+        }
+    };
     let perm_auth_key_id = f.perm_auth_key_id;
-    let perm_auth_key = ctx
-        .store
-        .load_auth_key(perm_auth_key_id)?
-        .ok_or_else(|| RpcError {
-            code: 400,
-            message: "PERM_AUTH_KEY_INVALID".into(),
-        })?;
+    let perm_auth_key = match ctx.store.load_auth_key(perm_auth_key_id)? {
+        Some(key) => key,
+        None => {
+            tracing::warn!(
+                temp_auth_key_id,
+                perm_auth_key_id,
+                "auth.bindTempAuthKey permanent key is missing"
+            );
+            return Err(RpcError {
+                code: 400,
+                message: "PERM_AUTH_KEY_INVALID".into(),
+            }
+            .into());
+        }
+    };
     let plaintext = crate::mtproto::decrypt_bound_key_message(
         &f.encrypted_message,
         &temp_auth_key,
