@@ -106,7 +106,7 @@ fn http_req_pq_echoes_nonce() {
         body: request.to_bytes(),
     };
     let response = http_mtproto::process(&state, &plain.encode()).unwrap();
-    let response = PlainMessage::decode(&response).unwrap();
+    let response = PlainMessage::decode_response(&response).unwrap();
     let ctor = u32::from_le_bytes(response.body[0..4].try_into().unwrap());
     assert_eq!(ctor, 0x05162463);
     let res_pq = grammers_tl_types::types::ResPq::from_bytes(&response.body[4..]).unwrap();

@@ -565,6 +565,14 @@ pub struct PlainMessage {
 
 impl PlainMessage {
     pub fn decode(data: &[u8]) -> Result<Self> {
+        Self::decode_with(data, false)
+    }
+
+    pub fn decode_response(data: &[u8]) -> Result<Self> {
+        Self::decode_with(data, true)
+    }
+
+    fn decode_with(data: &[u8], response: bool) -> Result<Self> {
         if data.len() < 20 {
             bail!("plain message too short");
         }
@@ -573,7 +581,13 @@ impl PlainMessage {
             bail!("not a plain message");
         }
         let msg_id = i64::from_le_bytes(data[8..16].try_into().unwrap());
-        if msg_id <= 0 || msg_id % 4 != 0 {
+        let marker = (msg_id & 3) as u32;
+        let valid = if response {
+            marker == 1 || marker == 3
+        } else {
+            marker == 0
+        };
+        if msg_id <= 0 || !valid {
             bail!("invalid plain message id {}", msg_id);
         }
         let len = i32::from_le_bytes(data[16..20].try_into().unwrap());
@@ -601,8 +615,8 @@ impl PlainMessage {
 }
 
 /// Generate a server message id: high 32 bits are wall-clock seconds, low 32
-/// bits encode the sequence. Message ids must remain divisible by four for
-/// both plain and encrypted MTProto packets.
+/// bits encode the sequence. Server messages use marker `1` (reply) or `3`
+/// (non-reply), while client requests use marker `0`.
 pub struct MsgIdGen {
     counter: u32,
 }
@@ -612,13 +626,13 @@ impl MsgIdGen {
         MsgIdGen { counter: 1 }
     }
 
-    pub fn next(&mut self, _response: bool) -> i64 {
+    pub fn next(&mut self, response: bool) -> i64 {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs() as u32)
             .unwrap_or(0);
         self.counter = self.counter.wrapping_add(4);
-        let low = self.counter & !3;
+        let low = (self.counter & !3) | if response { 1 } else { 0 };
         ((now as i64) << 32) | (low as i64)
     }
 }
