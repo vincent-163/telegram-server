@@ -31,6 +31,8 @@ pub enum TransportKind {
 pub struct Ctr {
     key: [u8; 32],
     counter: u128,
+    keystream: [u8; 16],
+    used: usize,
 }
 
 impl Ctr {
@@ -38,18 +40,30 @@ impl Ctr {
         Ctr {
             key: *key,
             counter: u128::from_be_bytes(*iv),
+            keystream: [0u8; 16],
+            used: 16,
         }
     }
 
     pub fn apply(&mut self, buf: &mut [u8]) {
-        if buf.is_empty() {
-            return;
+        let mut offset = 0;
+        while offset < buf.len() {
+            if self.used == 16 {
+                let block = self.counter.to_be_bytes();
+                let mut cipher = ctr::Ctr128BE::<aes::Aes256>::new(&self.key.into(), &block.into());
+                self.keystream = [0u8; 16];
+                cipher.apply_keystream(&mut self.keystream);
+                self.counter = self.counter.wrapping_add(1);
+                self.used = 0;
+            }
+            let available = 16 - self.used;
+            let take = available.min(buf.len() - offset);
+            for value in &mut buf[offset..offset + take] {
+                *value ^= self.keystream[self.used];
+                self.used += 1;
+            }
+            offset += take;
         }
-        let iv = self.counter.to_be_bytes();
-        let mut cipher = ctr::Ctr128BE::<aes::Aes256>::new(&self.key.into(), &iv.into());
-        cipher.apply_keystream(buf);
-        let blocks = ((buf.len() as u128) + 15) / 16;
-        self.counter = self.counter.wrapping_add(blocks);
     }
 }
 
@@ -560,5 +574,38 @@ mod tests {
         let got = dec.next_payload().unwrap().unwrap();
         assert_eq!(got.len(), payload.len() + 5);
         assert!(got.starts_with(&payload));
+    }
+
+    #[test]
+    fn obfuscated_payload_survives_tcp_sized_splits() {
+        let init = make_obfuscation_init(TRANSPORT_TAG_INTERMEDIATE);
+        let keys = ObfKeys::from_init(&init);
+        let mut client = Ctr::new(&keys.forward_key, &keys.forward_iv);
+
+        let mut wire_header = init;
+        client.apply(&mut wire_header);
+        wire_header[..56].copy_from_slice(&init[..56]);
+
+        let payload = vec![0x5au8; 32];
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        frame.extend_from_slice(&payload);
+        client.apply(&mut frame);
+
+        let mut dec = Decoder::new();
+        dec.push(&wire_header).unwrap();
+        assert!(dec.ensure_started().unwrap());
+        assert_eq!(dec.kind(), Some(TransportKind::Intermediate));
+        assert!(dec.is_obfuscated());
+
+        for (chunk_index, chunk) in frame.chunks(5).enumerate() {
+            dec.push(chunk).unwrap();
+            let got = dec.next_payload().unwrap();
+            if chunk_index + 1 < (frame.len() + 4) / 5 {
+                assert_eq!(got, None);
+            } else {
+                assert_eq!(got.as_deref(), Some(payload.as_slice()));
+            }
+        }
     }
 }
