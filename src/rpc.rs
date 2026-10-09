@@ -113,6 +113,7 @@ fn is_pre_auth_method(ctor: u32) -> bool {
         f::Ping::CONSTRUCTOR_ID
             | f::PingDelayDisconnect::CONSTRUCTOR_ID
             | f::DestroySession::CONSTRUCTOR_ID
+            | 0x62d6_b459
             | f::help::GetConfig::CONSTRUCTOR_ID
             | f::help::GetNearestDc::CONSTRUCTOR_ID
             | f::help::GetAppConfig::CONSTRUCTOR_ID
@@ -129,6 +130,9 @@ fn is_pre_auth_method(ctor: u32) -> bool {
             | f::auth::SignUp::CONSTRUCTOR_ID
             | f::auth::ResendCode::CONSTRUCTOR_ID
             | f::auth::CancelCode::CONSTRUCTOR_ID
+            | f::auth::ExportLoginToken::CONSTRUCTOR_ID
+            | f::auth::ImportLoginToken::CONSTRUCTOR_ID
+            | f::auth::InitPasskeyLogin::CONSTRUCTOR_ID
             | f::auth::LogOut::CONSTRUCTOR_ID
             | f::auth::ResetAuthorizations::CONSTRUCTOR_ID
             | f::auth::ExportAuthorization::CONSTRUCTOR_ID
@@ -180,7 +184,7 @@ fn dispatch_inner(ctx: &mut RpcContext, body: &[u8], ctor: u32) -> Result<Vec<u8
             let _ =
                 tl::functions::help::GetNearestDc::deserialize(&mut tl::Cursor::from_slice(args))?;
             let nd = tl::types::NearestDc {
-                country: "XX".into(),
+                country: "US".into(),
                 this_dc: ctx.cfg.dc_id,
                 nearest_dc: ctx.cfg.dc_id,
             };
@@ -195,6 +199,12 @@ fn dispatch_inner(ctx: &mut RpcContext, body: &[u8], ctor: u32) -> Result<Vec<u8
         0x8d52a951 => {
             let f = tl::functions::auth::SignIn::deserialize(&mut tl::Cursor::from_slice(args))?;
             return handle_sign_in(ctx, &f);
+        }
+        0xb7e085fe | 0x95ac5ce4 => {
+            return bail_rpc(400, "QR_LOGIN_UNSUPPORTED");
+        }
+        0x518ad0b7 => {
+            return bail_rpc(400, "PASSKEY_LOGIN_UNSUPPORTED");
         }
         0xaac7b717 => {
             // Self-registration is disabled: accounts are created by an admin.
@@ -1703,7 +1713,6 @@ fn handle_sign_in(ctx: &mut RpcContext, f: &tl::functions::auth::SignIn) -> Resu
         return bail_rpc(400, "PHONE_CODE_INVALID");
     }
     let device = ctx.store.device_info(ctx.auth_key_id)?;
-    let created = now();
     ctx.store.save_session(
         &format!("sess-{}", ctx.auth_key_id),
         user.id,
@@ -1713,7 +1722,6 @@ fn handle_sign_in(ctx: &mut RpcContext, f: &tl::functions::auth::SignIn) -> Resu
         device.2,
         60 * 60 * 24 * 365,
     )?;
-    ctx.store.save_auth_key(ctx.auth_key_id, &[0u8; 256])?;
     let auth = tl::types::auth::Authorization {
         setup_password_required: false,
         otherwise_relogin_days: None,
@@ -2158,10 +2166,13 @@ fn default_notify() -> tl::enums::PeerNotifySettings {
 /// field layouts are byte-identical, so a reply can be re-stamped for whichever
 /// layer the client announced.
 pub const LAYER_227: i32 = 227;
+const LAYER_229: i32 = 229;
 const MESSAGE_CTOR_224: u32 = 0x3ae56482;
 const MESSAGE_CTOR_227: u32 = 0x7600b9d3;
 const AUTH_AUTHORIZATION_CTOR_224: u32 = 0x2ea2c0d4;
 const AUTH_AUTHORIZATION_CTOR_227: u32 = 0xad01d61d;
+const USER_CTOR_227: u32 = 0x31774388;
+const USER_CTOR_229: u32 = 0xb1b8cc83;
 
 /// Rewrites a single object's leading constructor id when the client speaks an
 /// older layer than the schema this server serializes with.
@@ -2240,8 +2251,28 @@ fn restamp_authorization(body: &mut [u8], layer: i32) {
     );
 }
 
+fn restamp_user_for_layer(body: &mut [u8], layer: i32) {
+    if layer < LAYER_229 || body.len() < 4 {
+        return;
+    }
+    let current = USER_CTOR_227.to_le_bytes();
+    for offset in 0..=body.len() - 4 {
+        if body[offset..offset + 4] != current {
+            continue;
+        }
+        let mut cursor = tl::Cursor::from_slice(&body[offset..]);
+        if tl::enums::User::deserialize(&mut cursor).is_ok() {
+            body[offset..offset + 4].copy_from_slice(&USER_CTOR_229.to_le_bytes());
+        }
+    }
+}
+
 /// Downgrades the constructor ids in a reply to the layer the client announced.
 pub fn restamp_response_for_layer(body: &mut [u8], layer: i32, ctor: u32) {
+    if layer >= LAYER_229 {
+        restamp_user_for_layer(body, layer);
+        return;
+    }
     if layer >= LAYER_227 {
         return;
     }

@@ -94,6 +94,75 @@ fn auth_send_code_accepts_registered_phone_in_international_format() {
 }
 
 #[test]
+fn auth_sign_in_user_uses_tweb_layer_229_schema() {
+    let mut fx = setup();
+    fx.ctx.layer = 229;
+    let settings = tl::types::CodeSettings {
+        allow_flashcall: false,
+        current_number: false,
+        allow_app_hash: false,
+        allow_missed_call: false,
+        allow_firebase: false,
+        unknown_number: false,
+        logout_tokens: None,
+        token: None,
+        app_sandbox: None,
+    };
+    dispatch(
+        &mut fx.ctx,
+        &tl::functions::auth::SendCode {
+            phone_number: "+15550000001".into(),
+            api_id: 2,
+            api_hash: "test".into(),
+            settings: tl::enums::CodeSettings::Settings(settings),
+        }
+        .to_bytes(),
+    )
+    .expect("sendCode must issue a login code");
+
+    let body = dispatch(
+        &mut fx.ctx,
+        &tl::functions::auth::SignIn {
+            phone_number: "+15550000001".into(),
+            phone_code_hash: "hash".into(),
+            phone_code: Some("12345".into()),
+            email_verification: None,
+        }
+        .to_bytes(),
+    )
+    .expect("signIn must succeed");
+
+    let mut cursor = tl::Cursor::from_slice(&body);
+    let auth_ctor = u32::deserialize(&mut cursor).expect("auth constructor");
+    assert_eq!(auth_ctor, 0x2ea2c0d4);
+    let auth_flags = u32::deserialize(&mut cursor).expect("auth flags");
+    assert_eq!(auth_flags, 0);
+    let user_start = cursor.pos();
+    let user_ctor = u32::deserialize(&mut cursor).expect("user constructor");
+    assert_eq!(user_ctor, 0xb1b8cc83);
+    let _user_flags = u32::deserialize(&mut cursor).expect("user flags");
+    let user_flags2 = u32::deserialize(&mut cursor).expect("user flags2");
+    assert_eq!(
+        user_flags2 & (1 << 21),
+        0,
+        "layer 229 optional linked_community_id must be absent"
+    );
+
+    let mut restored = body.clone();
+    restored[user_start..user_start + 4].copy_from_slice(&0x31774388u32.to_le_bytes());
+    let parsed =
+        tl::enums::auth::Authorization::deserialize(&mut tl::Cursor::from_slice(&restored))
+            .expect("layer 229 user must retain the shared layer 227 field layout");
+    let tl::enums::auth::Authorization::Authorization(auth) = parsed else {
+        panic!("unexpected authorization variant");
+    };
+    let tl::enums::User::User(user) = auth.user else {
+        panic!("unexpected user variant");
+    };
+    assert_eq!(user.id, fx.ctx.user_id);
+}
+
+#[test]
 fn users_get_full_user_returns_profile() {
     let mut fx = setup();
     let me = fx.ctx.user_id;
