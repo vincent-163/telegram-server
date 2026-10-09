@@ -1510,13 +1510,16 @@ fn queued_update_replies(ctx: &RpcContext, req_msg_id: i64) -> Result<Vec<RpcRep
             pts,
             pts_count,
         };
-        let short = tl::types::UpdateShort {
-            update: tl::enums::Update::NewMessage(update),
+        let resp = tl::types::Updates {
+            updates: vec![tl::enums::Update::NewMessage(update)],
+            users,
+            chats,
             date: now() as i32,
+            seq: 1,
         };
         replies.push(RpcReply {
             req_msg_id,
-            body: tl::enums::Updates::UpdateShort(short).to_bytes(),
+            body: tl::enums::Updates::Updates(resp).to_bytes(),
         });
     }
     if cursor > 0 {

@@ -238,10 +238,12 @@ fn http_wait_delivers_a_queued_message_update_once() {
         }
     }
     assert!(constructors.contains(&NEW_SESSION_CREATED));
-    assert!(matches!(
-        tl::enums::Updates::from_bytes(&updates_body).unwrap(),
-        tl::enums::Updates::UpdateShort(_)
-    ));
+    let updates = tl::enums::Updates::from_bytes(&updates_body).unwrap();
+    let tl::enums::Updates::Updates(updates) = updates else {
+        panic!("expected full updates payload, got {updates:?}");
+    };
+    assert_eq!(updates.updates.len(), 1);
+    assert!(!updates.users.is_empty());
     assert!(state
         .store
         .pending_updates(user_id, auth_key_id(&key), 10)
@@ -272,10 +274,8 @@ fn http_container_delivers_a_queued_message_update_once() {
         let length = read_i32(&envelope.body, &mut offset) as usize;
         let reply = &envelope.body[offset..offset + length];
         offset += length;
-        if matches!(
-            tl::enums::Updates::from_bytes(reply),
-            Ok(tl::enums::Updates::UpdateShort(_))
-        ) {
+        if let Ok(tl::enums::Updates::Updates(updates)) = tl::enums::Updates::from_bytes(reply) {
+            assert!(!updates.users.is_empty());
             updates_seen = true;
         }
     }
