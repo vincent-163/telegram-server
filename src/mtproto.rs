@@ -766,6 +766,8 @@ pub fn decrypt_bound_key_message(
     temp_auth_key_id: i64,
     perm_auth_key_id: i64,
 ) -> Result<Vec<u8>> {
+    let mut v1_reason = String::from("not-attempted");
+    let mut v2_reason = String::from("not-attempted");
     if data.len() >= 24 {
         let key_id = i64::from_le_bytes(data[0..8].try_into().unwrap());
         // tweb seals the binding message with the permanent key under the
@@ -775,26 +777,41 @@ pub fn decrypt_bound_key_message(
             && key_id == auth_key_id(perm_auth_key)
             && (data.len() - 24) % 16 == 0
         {
-            if let Some(body) = decrypt_bound_key_message_v1(data, perm_auth_key) {
-                return Ok(body);
+            match decrypt_bound_key_message_v1(data, perm_auth_key) {
+                Ok(body) => return Ok(body),
+                Err(err) => v1_reason = err.to_string(),
             }
         }
         if key_id == temp_auth_key_id && key_id == auth_key_id(temp_auth_key) {
-            if let Ok(envelope) = EncryptedEnvelope::decode(data, temp_auth_key) {
-                return Ok(envelope.body);
+            match EncryptedEnvelope::decode(data, temp_auth_key) {
+                Ok(envelope) => return Ok(envelope.body),
+                Err(err) => v2_reason = err.to_string(),
             }
         }
     }
+    tracing::warn!(
+        key_id = if data.len() >= 8 {
+            i64::from_le_bytes(data[0..8].try_into().unwrap())
+        } else {
+            0
+        },
+        len = data.len(),
+        perm_auth_key_id,
+        temp_auth_key_id,
+        v1_reason = v1_reason.as_str(),
+        v2_reason = v2_reason.as_str(),
+        "could not decrypt auth.bindTempAuthKey inner message"
+    );
     bail!("could not decrypt bound auth key message")
 }
 
 /// Decrypt an MTProto 1.0 (SHA1) payload sealed with `auth_key`.
 ///
-/// Returns `None` rather than an error so callers can fall through to the
-/// 2.0 layout without turning a probe into a hard failure.
-fn decrypt_bound_key_message_v1(data: &[u8], auth_key: &[u8; 256]) -> Option<Vec<u8>> {
+/// Returns the failure stage rather than an error so callers can fall through
+/// to the 2.0 layout while still reporting what the probe found.
+fn decrypt_bound_key_message_v1(data: &[u8], auth_key: &[u8; 256]) -> Result<Vec<u8>> {
     if data.len() < 24 || (data.len() - 24) % 16 != 0 {
-        return None;
+        bail!("v1-envelope-length");
     }
     let mut msg_key = [0u8; 16];
     msg_key.copy_from_slice(&data[8..24]);
@@ -802,17 +819,17 @@ fn decrypt_bound_key_message_v1(data: &[u8], auth_key: &[u8; 256]) -> Option<Vec
     let mut plain = data[24..].to_vec();
     ige_decrypt(&mut plain, &key, &iv);
     if plain.len() < 32 {
-        return None;
+        bail!("v1-plaintext-short");
     }
     let len = i32::from_le_bytes(plain[28..32].try_into().unwrap());
     if len <= 0 || 32 + len as usize > plain.len() {
-        return None;
+        bail!("v1-body-length");
     }
     let body_len = 32 + len as usize;
     if msg_key_v1(&plain[..body_len]) != msg_key {
-        return None;
+        bail!("v1-msg-key-mismatch");
     }
-    Some(plain[32..body_len].to_vec())
+    Ok(plain[32..body_len].to_vec())
 }
 
 /// Build an `rpc_result` container for a response body.

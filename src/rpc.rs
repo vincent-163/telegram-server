@@ -1424,6 +1424,7 @@ fn request_method_name(body: &[u8]) -> &'static str {
         0xc4f9_186b => "help.getConfig",
         0xa677_244f => "auth.sendCode",
         0x8d52_a951 => "auth.signIn",
+        0xcdd_42a05 => "auth.bindTempAuthKey",
         HTTP_WAIT => "http.wait",
         MSG_CONTAINER => "msg_container",
         _ => "other",
@@ -1614,9 +1615,10 @@ fn handle_bind_temp_auth_key(
             code: 400,
             message: "TEMP_AUTH_KEY_INVALID".into(),
         })?;
+    let perm_auth_key_id = f.perm_auth_key_id;
     let perm_auth_key = ctx
         .store
-        .load_auth_key(f.perm_auth_key_id)?
+        .load_auth_key(perm_auth_key_id)?
         .ok_or_else(|| RpcError {
             code: 400,
             message: "PERM_AUTH_KEY_INVALID".into(),
@@ -1626,13 +1628,22 @@ fn handle_bind_temp_auth_key(
         &temp_auth_key,
         &perm_auth_key,
         temp_auth_key_id,
-        f.perm_auth_key_id,
+        perm_auth_key_id,
     )?;
     let inner = tl::types::BindAuthKeyInner::from_bytes(&plaintext)?;
     if inner.nonce != f.nonce
         || inner.temp_auth_key_id != temp_auth_key_id
-        || inner.perm_auth_key_id != f.perm_auth_key_id
+        || inner.perm_auth_key_id != perm_auth_key_id
     {
+        tracing::warn!(
+            request_nonce = f.nonce,
+            inner_nonce = inner.nonce,
+            request_perm_auth_key_id = perm_auth_key_id,
+            inner_perm_auth_key_id = inner.perm_auth_key_id,
+            expected_temp_auth_key_id = temp_auth_key_id,
+            inner_temp_auth_key_id = inner.temp_auth_key_id,
+            "auth.bindTempAuthKey inner fields do not match the request"
+        );
         return bail_rpc(400, "TEMP_AUTH_KEY_INVALID");
     }
     tracing::info!(
