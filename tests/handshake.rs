@@ -43,6 +43,18 @@ fn res_pq_echoes_client_nonce_and_carries_ctor() {
 }
 
 #[test]
+fn fake_connection_check_can_restart_for_real_pq_request() {
+    let key = RsaKeyPair::generate();
+    let mut handshake = Handshake::new([0x33; 16]);
+    handshake.step1(&key).unwrap();
+
+    handshake.restart_for_pq();
+    handshake.set_nonce([0x44; 16]);
+    let tl::enums::ResPq::Pq(res_pq) = handshake.step1(&key).unwrap();
+    assert_eq!(res_pq.nonce, [0x44; 16]);
+}
+
+#[test]
 fn complete_authorization_handshake() {
     let key = RsaKeyPair::generate();
     let mut handshake = Handshake::new([0x11; 16]);

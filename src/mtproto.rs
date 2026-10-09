@@ -355,6 +355,14 @@ impl Handshake {
         self.nonce = nonce;
     }
 
+    /// TDesktop sends a connection-validation `req_pq` before starting the
+    /// real auth-key exchange, then sends `req_pq_multi` on the same TCP
+    /// connection. Reset the placeholder exchange so the second request can
+    /// establish a fresh PQ challenge without reconnecting.
+    pub fn restart_for_pq(&mut self) {
+        *self = Handshake::new(rand::random());
+    }
+
     pub fn step1(&mut self, key: &RsaKeyPair) -> Result<tl::enums::ResPq> {
         if self.state != HandshakePhase::WaitingPq {
             bail!("handshake out of order");

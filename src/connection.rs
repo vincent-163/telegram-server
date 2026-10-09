@@ -6,7 +6,9 @@ use tokio::net::{TcpListener, TcpStream};
 
 use crate::config::Config;
 use crate::crypto::auth_key_id;
-use crate::mtproto::{EncryptedEnvelope, Handshake, MsgIdGen, PlainMessage, RsaKeyPair, SeqNoGen};
+use crate::mtproto::{
+    EncryptedEnvelope, Handshake, HandshakePhase, MsgIdGen, PlainMessage, RsaKeyPair, SeqNoGen,
+};
 use crate::rpc::{dispatch_replies, frame_replies, RpcContext};
 use crate::store::Store;
 use crate::transport::{Decoder, Encoder};
@@ -43,7 +45,7 @@ async fn handle(
     let mut decoder = Decoder::new();
     let mut encoder: Option<Encoder> = None;
     let mut handshake = Handshake::new(rand::random());
-    let mut auth_key: Option<[u8; 256]> = None;
+    let mut auth_keys: Vec<[u8; 256]> = Vec::new();
     let mut msg_ids = MsgIdGen::new();
     let mut seq_nos = SeqNoGen::new();
     let mut read = vec![0u8; 64 * 1024];
@@ -71,15 +73,30 @@ async fn handle(
             // boundary. Trimming plain messages to a 16-byte boundary (the old
             // behaviour) truncated larger requests such as req_DH_params.
             trim_transport_padding(&mut payload);
-            if let Some(key) = auth_key.as_ref() {
-                let env = match EncryptedEnvelope::decode(&payload, key) {
+            let is_plain = payload.len() >= 8 && payload[..8] == [0u8; 8];
+            if !is_plain {
+                if payload.len() < 8 {
+                    tracing::warn!("short encrypted packet from {}", peer);
+                    continue;
+                }
+                let packet_key_id = i64::from_le_bytes(payload[0..8].try_into().unwrap());
+                let key = auth_keys
+                    .iter()
+                    .find(|key| auth_key_id(key) == packet_key_id)
+                    .copied()
+                    .or_else(|| store.load_auth_key(packet_key_id).ok().flatten());
+                let Some(key) = key else {
+                    tracing::warn!("unknown auth key id {} from {}", packet_key_id, peer);
+                    continue;
+                };
+                let env = match EncryptedEnvelope::decode(&payload, &key) {
                     Ok(v) => v,
                     Err(e) => {
                         tracing::warn!("bad encrypted packet from {}: {:#}", peer, e);
                         continue;
                     }
                 };
-                let key_id = auth_key_id(key);
+                let key_id = auth_key_id(&key);
                 let mut ctx = RpcContext {
                     store: store.clone(),
                     cfg: cfg.clone(),
@@ -100,8 +117,12 @@ async fn handle(
                         seq_no,
                         body,
                     };
-                    write_frame(&mut stream, encoder.as_mut().unwrap(), &out_env.encode(key))
-                        .await?;
+                    write_frame(
+                        &mut stream,
+                        encoder.as_mut().unwrap(),
+                        &out_env.encode(&key),
+                    )
+                    .await?;
                 }
                 continue;
             }
@@ -111,12 +132,21 @@ async fn handle(
                 continue;
             }
             let ctor = u32::from_le_bytes(body[0..4].try_into().unwrap());
+            tracing::debug!(
+                peer = %peer,
+                constructor = format_args!("{ctor:#010x}"),
+                phase = ?handshake.state,
+                "plain MTProto request"
+            );
             let response_body = match ctor {
                 0x60469778 | 0xbe7e8ef1 => {
                     // Both req_pq#60469778 and req_pq_multi#be7e8ef1 carry the
                     // client nonce, which resPQ must echo back.
                     let mut cur = grammers_tl_types::Cursor::from_slice(&body[4..]);
                     let nonce = <[u8; 16] as Deserializable>::deserialize(&mut cur)?;
+                    if handshake.state != HandshakePhase::WaitingPq {
+                        handshake.restart_for_pq();
+                    }
                     handshake.set_nonce(nonce);
                     handshake
                         .step1(&rsa)
@@ -147,8 +177,11 @@ async fn handle(
                             handshake.state
                         )
                     })?;
-                    store.save_auth_key(auth_key_id(&key), &key)?;
-                    auth_key = Some(key);
+                    let key_id = auth_key_id(&key);
+                    store.save_auth_key(key_id, &key)?;
+                    if !auth_keys.iter().any(|known| auth_key_id(known) == key_id) {
+                        auth_keys.push(key);
+                    }
                     answer.to_bytes()
                 }
                 _ => bail!("unexpected plain MTProto constructor {:#010x}", ctor),
@@ -158,9 +191,6 @@ async fn handle(
                 body: response_body,
             };
             write_frame(&mut stream, encoder.as_mut().unwrap(), &response.encode()).await?;
-            if auth_key.is_some() {
-                break;
-            }
         }
     }
 }
