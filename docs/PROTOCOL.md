@@ -83,6 +83,8 @@ In addition:
   with `--login-code`.
 - Phone calls are not implemented.
 - Account registration is administrator-only; `auth.signUp` is rejected.
+- QR-code and passkey login return an explicit unsupported-method error;
+  phone-code login uses the administrator-configured local login code.
 - External Telegram CDN/config fetching is not used; the deployment serves a
   self-contained DC configuration.
 

@@ -27,6 +27,8 @@ operations, and an HTTP Bot API.
 - Public endpoint exposing the configured server IP/port and MTProto RSA public key.
 - No payments, premium, SMS delivery, or phone calls. Accounts are provisioned
   by an administrator and `auth.signUp` is rejected.
+- QR-code and passkey login are not implemented; phone-code login remains
+  available with the administrator-configured local login code.
 - Regenerate the compatibility table with
   `python3 tools/gen_compat.py target/debug/build/grammers-tl-types-*/out`.
 
