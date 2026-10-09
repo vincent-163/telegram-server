@@ -264,6 +264,11 @@ CREATE TABLE IF NOT EXISTS update_queue (
 );
 CREATE INDEX IF NOT EXISTS update_queue_user ON update_queue(user_id, seqno);
 
+CREATE TABLE IF NOT EXISTS session_update_cursors (
+    auth_key_id INTEGER PRIMARY KEY,
+    seqno INTEGER NOT NULL DEFAULT 0
+);
+
 CREATE TABLE IF NOT EXISTS settings (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -1269,6 +1274,40 @@ impl Store {
         conn.execute(
             "INSERT INTO update_queue(user_id,kind,payload,created_at) VALUES(?1,?2,?3,?4)",
             params![user_id, kind, payload, now()],
+        )?;
+        Ok(())
+    }
+
+    pub fn pending_updates(
+        &self,
+        user_id: i64,
+        auth_key_id: i64,
+        limit: i32,
+    ) -> Result<Vec<(i64, String, String)>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare_cached(
+            "SELECT q.seqno, q.kind, q.payload
+             FROM update_queue q
+             LEFT JOIN session_update_cursors c ON c.auth_key_id = ?2
+             WHERE q.user_id = ?1 AND q.seqno > COALESCE(c.seqno, 0)
+             ORDER BY q.seqno LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(params![user_id, auth_key_id, limit], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    pub fn advance_update_cursor(&self, auth_key_id: i64, seqno: i64) -> Result<()> {
+        let conn = self.conn();
+        conn.execute(
+            "INSERT INTO session_update_cursors(auth_key_id, seqno) VALUES(?1, ?2)
+             ON CONFLICT(auth_key_id) DO UPDATE SET seqno = MAX(seqno, excluded.seqno)",
+            params![auth_key_id, seqno],
         )?;
         Ok(())
     }

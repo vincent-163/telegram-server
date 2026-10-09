@@ -105,6 +105,10 @@ In addition:
 Files uploaded through the MTProto or Bot API paths are stored in SQLite and
 served by `/file/bot<token>/<file_id>`.
 
+Standalone `http_wait` requests honor the client's `max_wait` interval when no
+update is queued. Queued message updates are returned in the next long-poll
+response and each session consumes them once.
+
 ## Server public key discovery
 
 `GET /server-key` returns the MTProto fingerprint, both common PEM encodings,

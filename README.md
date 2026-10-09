@@ -24,6 +24,7 @@ operations, and an HTTP Bot API.
   `payments`, `premium`, `fragment` (real money), `phone`, `smsjobs`
   (telephony) and `aicompose` (hosted model).
 - HTTP Bot API methods: `getMe`, `sendMessage`, `sendPhoto`, `sendDocument`, `getUpdates`, `getChat`, `sendChatAction`, `setWebhook`, `deleteWebhook`, `setMyCommands`, and `deleteMyCommands`.
+- HTTP MTProto long polling with queued message updates delivered to waiting clients.
 - Public endpoint exposing the configured server IP/port and MTProto RSA public key.
 - No payments, premium, SMS delivery, or phone calls. Accounts are provisioned
   by an administrator and `auth.signUp` is rejected.

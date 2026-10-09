@@ -188,11 +188,14 @@ async fn bot_messages_reach_the_recipient_dialog() {
     )
     .await;
     assert_eq!(v["ok"], true);
+    let bot_id = fx.store.get_user_by_token(TOKEN).unwrap().unwrap().id;
     let rows = fx.store.dialogs_for(fx.user_id).unwrap();
     assert!(
-        rows.iter().any(|r| r.dialog_type == "user"),
+        rows.iter()
+            .any(|r| r.dialog_type == "user" && r.dialog_id == bot_id),
         "expected a user dialog, got {rows:?}"
     );
+    assert!(fx.store.get_message("user", bot_id, 1).unwrap().is_some());
 }
 
 #[tokio::test]

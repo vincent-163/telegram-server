@@ -1,14 +1,19 @@
+use axum::body::Body;
+use axum::http::Request;
 use grammers_tl_types as tl;
 use grammers_tl_types::{Deserializable, Serializable};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::OnceLock;
+use std::time::Instant;
+use telegram_server::botapi::router;
 use telegram_server::botapi::AppState;
 use telegram_server::config::Config;
 use telegram_server::crypto::auth_key_id;
 use telegram_server::http_mtproto::{self, HttpMtProtoState};
 use telegram_server::mtproto::{EncryptedEnvelope, PlainMessage, RsaKeyPair};
 use telegram_server::store::Store;
+use tower::ServiceExt;
 
 fn shared_rsa() -> &'static RsaKeyPair {
     static RSA: OnceLock<RsaKeyPair> = OnceLock::new();
@@ -160,6 +165,105 @@ fn http_wait_single_request_receives_new_session() {
         i64::from_le_bytes(envelope.body[4..12].try_into().unwrap()),
         request_msg_id
     );
+}
+
+#[test]
+fn http_wait_delivers_a_queued_message_update_once() {
+    let (state, _dir) = fixture();
+    let key = [0x44u8; 256];
+    setup_auth_key(&state, &key);
+    let user = state
+        .store
+        .create_user("15550000101", "Queued", "Update", "queued", false, false)
+        .unwrap();
+    let sender = state
+        .store
+        .create_user("15550000102", "Sender", "User", "sender", false, false)
+        .unwrap();
+    state
+        .store
+        .save_session(
+            "sess-http-update",
+            user.id,
+            auth_key_id(&key),
+            "",
+            "",
+            1,
+            3600,
+        )
+        .unwrap();
+    let message_id = state
+        .store
+        .insert_message(
+            "user", sender.id, sender.id, None, "queued", "", None, None, 7,
+        )
+        .unwrap();
+    state
+        .store
+        .push_update(
+            user.id,
+            "message",
+            &serde_json::json!({
+                "dialog_type": "user",
+                "dialog_id": sender.id,
+                "message_id": message_id
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+    let request = encrypted_request(&key, 21, 0x4100, &HTTP_WAIT);
+    let response = http_mtproto::process(&state, &request).unwrap();
+    let envelope = EncryptedEnvelope::decode(&response, &key).unwrap();
+    assert_eq!(ctor(&envelope.body), MSG_CONTAINER);
+    let count = i32::from_le_bytes(envelope.body[4..8].try_into().unwrap());
+    assert_eq!(count, 2);
+    let mut offset = 8;
+    let mut constructors = Vec::new();
+    let mut updates_body = Vec::new();
+    for _ in 0..count {
+        let _msg_id = read_i64(&envelope.body, &mut offset);
+        let _seq_no = read_i32(&envelope.body, &mut offset);
+        let length = read_i32(&envelope.body, &mut offset) as usize;
+        let body = &envelope.body[offset..offset + length];
+        offset += length;
+        constructors.push(ctor(body));
+        if ctor(body) != NEW_SESSION_CREATED {
+            updates_body = body.to_vec();
+        }
+    }
+    assert!(constructors.contains(&NEW_SESSION_CREATED));
+    assert!(matches!(
+        tl::enums::Updates::from_bytes(&updates_body).unwrap(),
+        tl::enums::Updates::UpdateShort(_)
+    ));
+    assert!(state
+        .store
+        .pending_updates(user.id, auth_key_id(&key), 10)
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn http_wait_long_poll_waits_before_returning() {
+    let (state, _dir) = fixture();
+    let key = [0x55u8; 256];
+    setup_auth_key(&state, &key);
+    let mut body = HTTP_WAIT.to_vec();
+    body.extend_from_slice(&0i32.to_le_bytes());
+    body.extend_from_slice(&0i32.to_le_bytes());
+    body.extend_from_slice(&60i32.to_le_bytes());
+    let request_body = encrypted_request(&key, 31, 0x4200, &body);
+    let app = router(state.clone());
+    let request = Request::builder()
+        .method("POST")
+        .uri("/apiw1")
+        .body(Body::from(request_body))
+        .unwrap();
+    let started = Instant::now();
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    assert!(started.elapsed().as_millis() >= 40);
 }
 
 /// Two answered requests must be batched into a real `msg_container`, with

@@ -6,6 +6,7 @@ use axum::response::{IntoResponse, Response};
 use grammers_tl_types::{Deserializable, Serializable};
 use parking_lot::Mutex;
 use std::collections::HashMap;
+use std::time::Duration;
 
 use crate::botapi::AppState;
 use crate::crypto::auth_key_id;
@@ -37,6 +38,11 @@ pub async fn handle(State(state): State<AppState>, body: Bytes) -> Response {
     }
 
     tracing::info!(bytes = body.len(), "HTTP MTProto request received");
+    match long_poll_delay(&state, &body) {
+        Ok(Some(delay)) => tokio::time::sleep(delay).await,
+        Ok(None) => {}
+        Err(error) => tracing::warn!("HTTP long-poll inspection failed: {:#}", error),
+    }
     match process(&state, &body) {
         Ok(response) => {
             let mut response = response.into_response();
@@ -50,6 +56,38 @@ pub async fn handle(State(state): State<AppState>, body: Bytes) -> Response {
             response
         }
     }
+}
+
+fn long_poll_delay(state: &AppState, payload: &[u8]) -> Result<Option<Duration>> {
+    if payload.len() < 8 || i64::from_le_bytes(payload[0..8].try_into().unwrap()) == 0 {
+        return Ok(None);
+    }
+    let key_id = i64::from_le_bytes(payload[0..8].try_into().unwrap());
+    let Some(key) = state.store.load_auth_key(key_id)? else {
+        return Ok(None);
+    };
+    let envelope = EncryptedEnvelope::decode(payload, &key)?;
+    if envelope.body.len() < 4 {
+        return Ok(None);
+    }
+    let ctor_bytes: [u8; 4] = envelope.body[0..4].try_into().unwrap_or([0; 4]);
+    if u32::from_le_bytes(ctor_bytes) != 0x9299_359f {
+        return Ok(None);
+    }
+    if envelope.body.len() < 16 {
+        return Ok(Some(Duration::from_millis(25_000)));
+    }
+    let max_wait = i32::from_le_bytes(envelope.body[12..16].try_into().unwrap()).clamp(0, 60_000);
+    let user_id = state.store.session_user(auth_key_id(&key))?.unwrap_or(0);
+    if user_id != 0
+        && !state
+            .store
+            .pending_updates(user_id, auth_key_id(&key), 1)?
+            .is_empty()
+    {
+        return Ok(None);
+    }
+    Ok(Some(Duration::from_millis(max_wait as u64)))
 }
 
 pub fn process(state: &AppState, payload: &[u8]) -> Result<Vec<u8>> {

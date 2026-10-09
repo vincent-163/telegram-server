@@ -1368,10 +1368,19 @@ pub fn as_rpc_error(err: &anyhow::Error) -> Option<&RpcError> {
 pub fn dispatch_replies(ctx: &mut RpcContext, body: &[u8], msg_id: i64) -> Vec<RpcReply> {
     if ctor_of(body) != MSG_CONTAINER {
         if ctor_of(body) == HTTP_WAIT {
-            return vec![RpcReply {
+            let mut replies = vec![RpcReply {
                 req_msg_id: msg_id,
                 body: new_session_created(msg_id),
             }];
+            match queued_update_replies(ctx, msg_id) {
+                Ok(mut queued) => replies.append(&mut queued),
+                Err(error) => tracing::warn!(
+                    req_msg_id = msg_id,
+                    "failed to queue HTTP updates: {:#}",
+                    error
+                ),
+            }
+            return replies;
         }
         log_request_constructor(msg_id, body, "single");
         return frame_reply(ctx, msg_id, body).into_iter().collect();
@@ -1403,6 +1412,85 @@ fn new_session_created(first_msg_id: i64) -> Vec<u8> {
     body.extend_from_slice(&(now() as i64).to_le_bytes());
     body.extend_from_slice(&0i64.to_le_bytes());
     body
+}
+
+fn queued_update_replies(ctx: &RpcContext, req_msg_id: i64) -> Result<Vec<RpcReply>> {
+    let rows = ctx
+        .store
+        .pending_updates(ctx.user_id, ctx.auth_key_id, 32)?;
+    if rows.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut replies = Vec::with_capacity(rows.len());
+    let mut cursor = 0i64;
+    for (seqno, kind, payload) in rows {
+        cursor = seqno;
+        let descriptor: serde_json::Value = match serde_json::from_str(&payload) {
+            Ok(value) => value,
+            Err(error) => {
+                tracing::warn!(seqno, kind, "invalid queued update payload: {}", error);
+                continue;
+            }
+        };
+        let (Some(dialog_type), Some(dialog_id), Some(message_id)) = (
+            descriptor.get("dialog_type").and_then(|v| v.as_str()),
+            descriptor.get("dialog_id").and_then(|v| v.as_i64()),
+            descriptor.get("message_id").and_then(|v| v.as_i64()),
+        ) else {
+            tracing::warn!(seqno, kind, "queued update is missing message coordinates");
+            continue;
+        };
+        let Some(message) = ctx
+            .store
+            .get_message(dialog_type, dialog_id, message_id as i32)?
+        else {
+            tracing::warn!(
+                seqno,
+                kind,
+                dialog_type,
+                dialog_id,
+                message_id,
+                "queued message is missing"
+            );
+            continue;
+        };
+        let peer = peer_of_dialog(dialog_type, dialog_id, ctx.user_id);
+        let mut users = Vec::new();
+        let mut chats = Vec::new();
+        collect_refs(ctx, &peer, &mut users, &mut chats)?;
+        let peer_user = match &peer {
+            tl::enums::Peer::User(user) => Some(user.user_id),
+            _ => None,
+        };
+        if message.sender_chat_id.is_some() || peer_user != Some(message.sender_id) {
+            let sender_peer = if let Some(chat_id) = message.sender_chat_id {
+                tl::enums::Peer::Chat(tl::types::PeerChat { chat_id })
+            } else {
+                tl::enums::Peer::User(tl::types::PeerUser {
+                    user_id: message.sender_id,
+                })
+            };
+            collect_refs(ctx, &sender_peer, &mut users, &mut chats)?;
+        }
+        let (pts, pts_count) = ctx.store.bump_pts(ctx.user_id)?;
+        let update = tl::types::UpdateNewMessage {
+            message: build_message(&message, peer),
+            pts,
+            pts_count,
+        };
+        let short = tl::types::UpdateShort {
+            update: tl::enums::Update::NewMessage(update),
+            date: now() as i32,
+        };
+        replies.push(RpcReply {
+            req_msg_id,
+            body: tl::enums::Updates::UpdateShort(short).to_bytes(),
+        });
+    }
+    if cursor > 0 {
+        ctx.store.advance_update_cursor(ctx.auth_key_id, cursor)?;
+    }
+    Ok(replies)
 }
 
 fn log_request_constructor(msg_id: i64, body: &[u8], shape: &'static str) {
@@ -1844,6 +1932,27 @@ fn handle_send_message(ctx: &mut RpcContext, f: &SendMessageArgs) -> Result<Vec<
         f.random_id,
     )?;
     let (pts, pts_count) = bump_pts(ctx, ctx.user_id)?;
+    if kind == "user" && id != ctx.user_id {
+        let descriptor = serde_json::json!({
+            "dialog_type": "user",
+            "dialog_id": ctx.user_id,
+            "message_id": msg_id
+        });
+        ctx.store
+            .push_update(id, "message", &descriptor.to_string())?;
+    } else if kind != "user" {
+        let descriptor = serde_json::json!({
+            "dialog_type": kind,
+            "dialog_id": id,
+            "message_id": msg_id
+        });
+        for (member, _) in ctx.store.chat_members(id)? {
+            if member != ctx.user_id {
+                ctx.store
+                    .push_update(member, "message", &descriptor.to_string())?;
+            }
+        }
+    }
     if kind == "user" && id != ctx.user_id {
         ctx.store.push_bot_update(
             id,

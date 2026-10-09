@@ -244,7 +244,14 @@ fn send_message(
     file_id: Option<&str>,
 ) -> Result<i32> {
     let kind = if chat_id > 0 { "user" } else { "chat" };
-    let dialog_id = chat_id.abs();
+    if kind == "user" && state.store.get_user(chat_id)?.is_none() {
+        return Err(anyhow!("chat not found"));
+    }
+    let dialog_id = if kind == "user" {
+        bot.id
+    } else {
+        chat_id.abs()
+    };
     let msg_id = state.store.insert_message(
         kind,
         dialog_id,
@@ -259,6 +266,14 @@ fn send_message(
     state
         .store
         .touch_dialog(chat_id, kind, dialog_id, msg_id, true)?;
+    let descriptor = serde_json::json!({
+        "dialog_type": kind,
+        "dialog_id": dialog_id,
+        "message_id": msg_id
+    });
+    state
+        .store
+        .push_update(chat_id, "message", &descriptor.to_string())?;
     let payload = json!({
         "message_id": msg_id,
         "chat": {"id": chat_id, "type": if kind == "user" { "private" } else { "supergroup" }},
