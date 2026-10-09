@@ -1607,17 +1607,26 @@ fn handle_bind_temp_auth_key(
     use tl::Deserializable as _;
 
     let temp_auth_key_id = ctx.auth_key_id;
-    let auth_key = ctx
+    let temp_auth_key = ctx
         .store
         .load_auth_key(temp_auth_key_id)?
         .ok_or_else(|| RpcError {
             code: 400,
             message: "TEMP_AUTH_KEY_INVALID".into(),
         })?;
+    let perm_auth_key = ctx
+        .store
+        .load_auth_key(f.perm_auth_key_id)?
+        .ok_or_else(|| RpcError {
+            code: 400,
+            message: "PERM_AUTH_KEY_INVALID".into(),
+        })?;
     let plaintext = crate::mtproto::decrypt_bound_key_message(
         &f.encrypted_message,
-        &auth_key,
+        &temp_auth_key,
+        &perm_auth_key,
         temp_auth_key_id,
+        f.perm_auth_key_id,
     )?;
     let inner = tl::types::BindAuthKeyInner::from_bytes(&plaintext)?;
     if inner.nonce != f.nonce

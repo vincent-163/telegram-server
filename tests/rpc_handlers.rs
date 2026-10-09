@@ -419,6 +419,69 @@ fn unknown_ctor_returns_rpc_error() {
     assert!(telegram_server::rpc::as_rpc_error(&err).is_some());
 }
 
+/// tweb seals `auth.bindTempAuthKey`'s inner message with the *permanent* key
+/// under the MTProto 1.0 (SHA1) scheme, prefixed by a random 128-bit value
+/// instead of salt/session. Reproduced here byte for byte from
+/// `src/tests/pfsNetworker.test.ts`, because a 2.0-only decrypt rejects it
+/// with TEMP_AUTH_KEY_INVALID and the login never leaves "Please Wait".
+#[test]
+fn auth_bind_temp_auth_key_accepts_legacy_permanent_key_envelope() {
+    use telegram_server::crypto::{auth_key_id, ige_encrypt, msg_key_v1, msg_key_v1_to_aes_key_iv};
+
+    let mut fx = setup();
+    let perm_key = [0x77u8; 256];
+    let temp_key = [0x31u8; 256];
+    let perm_id = auth_key_id(&perm_key);
+    let temp_id = auth_key_id(&temp_key);
+    fx.ctx.store.save_auth_key(perm_id, &perm_key).unwrap();
+    fx.ctx.store.save_auth_key(temp_id, &temp_key).unwrap();
+    // The binding call travels over the *temporary* key, so that is the key the
+    // transport reported for this request.
+    fx.ctx.auth_key_id = temp_id;
+
+    let nonce = 0x1122_3344_5566_7788i64;
+    let temp_session_id = 0x0a0b_0c0d_0e0f_1011i64;
+    let msg_id = 0x7fff_0000_0000_0004i64;
+    let inner = tl::types::BindAuthKeyInner {
+        nonce,
+        temp_auth_key_id: temp_id,
+        perm_auth_key_id: perm_id,
+        temp_session_id,
+        expires_at: 1_700_000_000,
+    }
+    .to_bytes();
+
+    // The inner object is identical to the TL serialization, but the 1.0 body
+    // carries a random 16-byte prefix in place of salt + session_id.
+    let mut plain = vec![0xABu8; 16];
+    plain.extend_from_slice(&msg_id.to_le_bytes());
+    plain.extend_from_slice(&0i32.to_le_bytes());
+    plain.extend_from_slice(&(inner.len() as i32).to_le_bytes());
+    plain.extend_from_slice(&inner);
+    let unpadded_len = plain.len();
+    while plain.len() % 16 != 0 {
+        plain.push(0xCC);
+    }
+
+    let msg_key = msg_key_v1(&plain[..unpadded_len]);
+    // Client -> server: x = 0, i.e. `from_client = true`.
+    let (key, iv) = msg_key_v1_to_aes_key_iv(&perm_key, &msg_key, true);
+    let mut encrypted = plain.clone();
+    ige_encrypt(&mut encrypted, &key, &iv);
+    let mut envelope = perm_id.to_le_bytes().to_vec();
+    envelope.extend_from_slice(&msg_key);
+    envelope.extend_from_slice(&encrypted);
+
+    let request = tl::functions::auth::BindTempAuthKey {
+        perm_auth_key_id: perm_id,
+        nonce,
+        expires_at: 1_700_000_000,
+        encrypted_message: envelope,
+    };
+    let status: bool = call(&mut fx.ctx, &request);
+    assert!(status);
+}
+
 // --------------------------------------------------------------------------
 // Constructor-id regressions.
 //

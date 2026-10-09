@@ -761,15 +761,58 @@ impl EncryptedEnvelope {
 /// including the salt, session, message id and sequence prefix.
 pub fn decrypt_bound_key_message(
     data: &[u8],
-    auth_key: &[u8; 256],
+    temp_auth_key: &[u8; 256],
+    perm_auth_key: &[u8; 256],
     temp_auth_key_id: i64,
+    perm_auth_key_id: i64,
 ) -> Result<Vec<u8>> {
-    let envelope = EncryptedEnvelope::decode(data, auth_key)?;
-    if envelope.salt != 0 || envelope.session_id <= 0 {
-        bail!("invalid bound-key payload metadata");
+    if data.len() >= 24 {
+        let key_id = i64::from_le_bytes(data[0..8].try_into().unwrap());
+        // tweb seals the binding message with the permanent key under the
+        // MTProto 1.0 (SHA1) scheme; try that first so the common case does
+        // not pay for a failed 2.0 decrypt.
+        if key_id == perm_auth_key_id
+            && key_id == auth_key_id(perm_auth_key)
+            && (data.len() - 24) % 16 == 0
+        {
+            if let Some(body) = decrypt_bound_key_message_v1(data, perm_auth_key) {
+                return Ok(body);
+            }
+        }
+        if key_id == temp_auth_key_id && key_id == auth_key_id(temp_auth_key) {
+            if let Ok(envelope) = EncryptedEnvelope::decode(data, temp_auth_key) {
+                return Ok(envelope.body);
+            }
+        }
     }
-    let _ = temp_auth_key_id;
-    Ok(envelope.body)
+    bail!("could not decrypt bound auth key message")
+}
+
+/// Decrypt an MTProto 1.0 (SHA1) payload sealed with `auth_key`.
+///
+/// Returns `None` rather than an error so callers can fall through to the
+/// 2.0 layout without turning a probe into a hard failure.
+fn decrypt_bound_key_message_v1(data: &[u8], auth_key: &[u8; 256]) -> Option<Vec<u8>> {
+    if data.len() < 24 || (data.len() - 24) % 16 != 0 {
+        return None;
+    }
+    let mut msg_key = [0u8; 16];
+    msg_key.copy_from_slice(&data[8..24]);
+    let (key, iv) = msg_key_v1_to_aes_key_iv(auth_key, &msg_key, true);
+    let mut plain = data[24..].to_vec();
+    ige_decrypt(&mut plain, &key, &iv);
+    if plain.len() < 32 {
+        return None;
+    }
+    let len = i32::from_le_bytes(plain[28..32].try_into().unwrap());
+    if len <= 0 || 32 + len as usize > plain.len() {
+        return None;
+    }
+    let body_len = 32 + len as usize;
+    if msg_key_v1(&plain[..body_len]) != msg_key {
+        return None;
+    }
+    Some(plain[32..body_len].to_vec())
 }
 
 /// Build an `rpc_result` container for a response body.

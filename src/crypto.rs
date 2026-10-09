@@ -107,6 +107,45 @@ pub fn auth_key_id(auth_key: &[u8; 256]) -> i64 {
     i64::from_le_bytes(h[12..20].try_into().unwrap())
 }
 
+/// MTProto 1.0 AES key/IV derivation from `auth_key` and `msg_key`.
+///
+/// The older scheme is still required for `auth.bindTempAuthKey`, whose inner
+/// message tweb seals with the permanent key using SHA1-derived material.
+/// `from_client` selects x=0 (client->server) or x=8 (server->client).
+pub fn msg_key_v1_to_aes_key_iv(
+    auth_key: &[u8; 256],
+    msg_key: &[u8; 16],
+    from_client: bool,
+) -> ([u8; 32], [u8; 32]) {
+    let x = if from_client { 0 } else { 8 };
+    let sha_a = sha1_concat(&[msg_key, &auth_key[x..x + 32]]);
+    let sha_b = sha1_concat(&[
+        &auth_key[32 + x..32 + x + 16],
+        msg_key,
+        &auth_key[48 + x..48 + x + 16],
+    ]);
+    let sha_c = sha1_concat(&[&auth_key[64 + x..64 + x + 32], msg_key]);
+    let sha_d = sha1_concat(&[msg_key, &auth_key[96 + x..96 + x + 32]]);
+
+    let mut key = [0u8; 32];
+    key[0..8].copy_from_slice(&sha_a[0..8]);
+    key[8..20].copy_from_slice(&sha_b[8..20]);
+    key[20..32].copy_from_slice(&sha_c[4..16]);
+
+    let mut iv = [0u8; 32];
+    iv[0..12].copy_from_slice(&sha_a[8..20]);
+    iv[12..20].copy_from_slice(&sha_b[0..8]);
+    iv[20..24].copy_from_slice(&sha_c[16..20]);
+    iv[24..32].copy_from_slice(&sha_d[0..8]);
+    (key, iv)
+}
+
+/// MTProto 1.0 `msg_key`: `SHA1(plaintext without padding)[4..20]`.
+pub fn msg_key_v1(plaintext_without_padding: &[u8]) -> [u8; 16] {
+    let hash = sha1(plaintext_without_padding);
+    hash[4..20].try_into().unwrap()
+}
+
 /// Generate the authorization key from the nonces, per the MTProto spec:
 /// `auth_key = substr(SHA1(new_nonce + server_nonce), 0, 256)`.
 pub fn auth_key_from_nonces(server_nonce: &[u8; 16], new_nonce: &[u8; 32]) -> [u8; 256] {
