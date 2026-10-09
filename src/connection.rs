@@ -118,7 +118,10 @@ async fn handle(
                     let mut cur = grammers_tl_types::Cursor::from_slice(&body[4..]);
                     let nonce = <[u8; 16] as Deserializable>::deserialize(&mut cur)?;
                     handshake.set_nonce(nonce);
-                    handshake.step1(&rsa)?.to_bytes()
+                    handshake
+                        .step1(&rsa)
+                        .with_context(|| format!("process req_pq in phase {:?}", handshake.state))?
+                        .to_bytes()
                 }
                 0xd712e4be => {
                     // Generated `Deserializable` impls read only the fields;
@@ -127,13 +130,23 @@ async fn handle(
                     let f = grammers_tl_types::functions::ReqDhParams::deserialize(
                         &mut grammers_tl_types::Cursor::from_slice(&body[4..]),
                     )?;
-                    handshake.step2(&f, &rsa)?.to_bytes()
+                    handshake
+                        .step2(&f, &rsa)
+                        .with_context(|| {
+                            format!("process req_DH_params in phase {:?}", handshake.state)
+                        })?
+                        .to_bytes()
                 }
                 0xf5045f1f => {
                     let f = grammers_tl_types::functions::SetClientDhParams::deserialize(
                         &mut grammers_tl_types::Cursor::from_slice(&body[4..]),
                     )?;
-                    let (answer, key, _salt) = handshake.step3(&f)?;
+                    let (answer, key, _salt) = handshake.step3(&f).with_context(|| {
+                        format!(
+                            "process set_client_DH_params in phase {:?}",
+                            handshake.state
+                        )
+                    })?;
                     store.save_auth_key(auth_key_id(&key), &key)?;
                     auth_key = Some(key);
                     answer.to_bytes()
