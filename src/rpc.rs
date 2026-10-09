@@ -1363,8 +1363,9 @@ pub fn as_rpc_error(err: &anyhow::Error) -> Option<&RpcError> {
 /// Batched clients put several requests inside one `msg_container`. Answering
 /// with a single `rpc_result` keyed by the container id leaves every inner
 /// deferred unresolved, so each inner message gets its own reply instead.
-/// `http_wait` is deliberately dropped: it never has a TL reply, and the
-/// transport response is what settles it.
+/// `http_wait` never has a TL reply. Standalone waits settle the transport with
+/// `newSessionCreated`; batched waits only deliver queued updates so normal
+/// keepalive batches keep their existing shape.
 pub fn dispatch_replies(ctx: &mut RpcContext, body: &[u8], msg_id: i64) -> Vec<RpcReply> {
     if ctor_of(body) != MSG_CONTAINER {
         if ctor_of(body) == HTTP_WAIT {
@@ -1388,21 +1389,52 @@ pub fn dispatch_replies(ctx: &mut RpcContext, body: &[u8], msg_id: i64) -> Vec<R
     match parse_container(body) {
         Ok(messages) => {
             log_batched_requests(msg_id, &messages);
-            messages
-                .into_iter()
-                .filter_map(|(inner_msg_id, inner)| {
-                    if ctor_of(&inner) == HTTP_WAIT {
-                        return None;
+            let mut replies = Vec::new();
+            for (inner_msg_id, inner) in messages {
+                if ctor_of(&inner) == HTTP_WAIT {
+                    match queued_update_replies(ctx, inner_msg_id) {
+                        Ok(mut queued) => replies.append(&mut queued),
+                        Err(error) => tracing::warn!(
+                            inner_msg_id,
+                            "failed to queue HTTP updates: {:#}",
+                            error
+                        ),
                     }
-                    frame_reply(ctx, inner_msg_id, &inner)
-                })
-                .collect()
+                    continue;
+                }
+                if let Some(reply) = frame_reply(ctx, inner_msg_id, &inner) {
+                    replies.push(reply);
+                }
+            }
+            replies
         }
         Err(error) => vec![RpcReply {
             req_msg_id: msg_id,
             body: framed_error(msg_id, &error, body),
         }],
     }
+}
+
+/// Return the longest `http.wait` timeout in a standalone or batched request.
+pub fn http_wait_max_wait(body: &[u8]) -> Result<Option<i32>> {
+    if ctor_of(body) == HTTP_WAIT {
+        return Ok(Some(read_http_wait_max_wait(body)));
+    }
+    if ctor_of(body) == MSG_CONTAINER {
+        for (_, inner) in parse_container(body)? {
+            if ctor_of(&inner) == HTTP_WAIT {
+                return Ok(Some(read_http_wait_max_wait(&inner)));
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn read_http_wait_max_wait(body: &[u8]) -> i32 {
+    if body.len() < 16 {
+        return 25_000;
+    }
+    i32::from_le_bytes(body[12..16].try_into().unwrap()).clamp(0, 60_000)
 }
 
 fn new_session_created(first_msg_id: i64) -> Vec<u8> {

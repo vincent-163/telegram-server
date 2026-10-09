@@ -80,6 +80,49 @@ fn setup_auth_key(state: &AppState, key: &[u8; 256]) {
     state.store.save_auth_key(auth_key_id(key), key).unwrap();
 }
 
+fn queue_test_message_update(state: &AppState, key: &[u8; 256]) -> i64 {
+    let user = state
+        .store
+        .create_user("15550000101", "Queued", "Update", "queued", false, false)
+        .unwrap();
+    let sender = state
+        .store
+        .create_user("15550000102", "Sender", "User", "sender", false, false)
+        .unwrap();
+    state
+        .store
+        .save_session(
+            "sess-http-update",
+            user.id,
+            auth_key_id(key),
+            "",
+            "",
+            1,
+            3600,
+        )
+        .unwrap();
+    let message_id = state
+        .store
+        .insert_message(
+            "user", sender.id, sender.id, None, "queued", "", None, None, 7,
+        )
+        .unwrap();
+    state
+        .store
+        .push_update(
+            user.id,
+            "message",
+            &serde_json::json!({
+                "dialog_type": "user",
+                "dialog_id": sender.id,
+                "message_id": message_id
+            })
+            .to_string(),
+        )
+        .unwrap();
+    user.id
+}
+
 fn read_i32(body: &[u8], off: &mut usize) -> i32 {
     let v = i32::from_le_bytes(body[*off..*off + 4].try_into().unwrap());
     *off += 4;
@@ -172,45 +215,7 @@ fn http_wait_delivers_a_queued_message_update_once() {
     let (state, _dir) = fixture();
     let key = [0x44u8; 256];
     setup_auth_key(&state, &key);
-    let user = state
-        .store
-        .create_user("15550000101", "Queued", "Update", "queued", false, false)
-        .unwrap();
-    let sender = state
-        .store
-        .create_user("15550000102", "Sender", "User", "sender", false, false)
-        .unwrap();
-    state
-        .store
-        .save_session(
-            "sess-http-update",
-            user.id,
-            auth_key_id(&key),
-            "",
-            "",
-            1,
-            3600,
-        )
-        .unwrap();
-    let message_id = state
-        .store
-        .insert_message(
-            "user", sender.id, sender.id, None, "queued", "", None, None, 7,
-        )
-        .unwrap();
-    state
-        .store
-        .push_update(
-            user.id,
-            "message",
-            &serde_json::json!({
-                "dialog_type": "user",
-                "dialog_id": sender.id,
-                "message_id": message_id
-            })
-            .to_string(),
-        )
-        .unwrap();
+    let user_id = queue_test_message_update(&state, &key);
 
     let request = encrypted_request(&key, 21, 0x4100, &HTTP_WAIT);
     let response = http_mtproto::process(&state, &request).unwrap();
@@ -239,7 +244,45 @@ fn http_wait_delivers_a_queued_message_update_once() {
     ));
     assert!(state
         .store
-        .pending_updates(user.id, auth_key_id(&key), 10)
+        .pending_updates(user_id, auth_key_id(&key), 10)
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn http_container_delivers_a_queued_message_update_once() {
+    let (state, _dir) = fixture();
+    let key = [0x46u8; 256];
+    setup_auth_key(&state, &key);
+    let user_id = queue_test_message_update(&state, &key);
+    let config_msg_id = 0x5100i64;
+    let wait_msg_id = 0x5110i64;
+    let body = container(&[(config_msg_id, &HELP_GET_CONFIG), (wait_msg_id, &HTTP_WAIT)]);
+    let request = encrypted_request(&key, 23, 0x4300, &body);
+    let response = http_mtproto::process(&state, &request).unwrap();
+    let envelope = EncryptedEnvelope::decode(&response, &key).unwrap();
+    assert_eq!(ctor(&envelope.body), MSG_CONTAINER);
+    let count = i32::from_le_bytes(envelope.body[4..8].try_into().unwrap());
+    assert_eq!(count, 2);
+    let mut offset = 8;
+    let mut updates_seen = false;
+    for _ in 0..count {
+        let _msg_id = read_i64(&envelope.body, &mut offset);
+        let _seq_no = read_i32(&envelope.body, &mut offset);
+        let length = read_i32(&envelope.body, &mut offset) as usize;
+        let reply = &envelope.body[offset..offset + length];
+        offset += length;
+        if matches!(
+            tl::enums::Updates::from_bytes(reply),
+            Ok(tl::enums::Updates::UpdateShort(_))
+        ) {
+            updates_seen = true;
+        }
+    }
+    assert!(updates_seen);
+    assert!(state
+        .store
+        .pending_updates(user_id, auth_key_id(&key), 10)
         .unwrap()
         .is_empty());
 }
@@ -254,6 +297,29 @@ async fn http_wait_long_poll_waits_before_returning() {
     body.extend_from_slice(&0i32.to_le_bytes());
     body.extend_from_slice(&60i32.to_le_bytes());
     let request_body = encrypted_request(&key, 31, 0x4200, &body);
+    let app = router(state.clone());
+    let request = Request::builder()
+        .method("POST")
+        .uri("/apiw1")
+        .body(Body::from(request_body))
+        .unwrap();
+    let started = Instant::now();
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    assert!(started.elapsed().as_millis() >= 40);
+}
+
+#[tokio::test]
+async fn http_container_long_poll_waits_before_returning() {
+    let (state, _dir) = fixture();
+    let key = [0x57u8; 256];
+    setup_auth_key(&state, &key);
+    let mut wait_body = HTTP_WAIT.to_vec();
+    wait_body.extend_from_slice(&0i32.to_le_bytes());
+    wait_body.extend_from_slice(&0i32.to_le_bytes());
+    wait_body.extend_from_slice(&60i32.to_le_bytes());
+    let body = container(&[(0x5200i64, &HELP_GET_CONFIG), (0x5210i64, &wait_body)]);
+    let request_body = encrypted_request(&key, 33, 0x4400, &body);
     let app = router(state.clone());
     let request = Request::builder()
         .method("POST")

@@ -11,7 +11,7 @@ use std::time::Duration;
 use crate::botapi::AppState;
 use crate::crypto::auth_key_id;
 use crate::mtproto::{EncryptedEnvelope, Handshake, MsgIdGen, PlainMessage, SeqNoGen};
-use crate::rpc::{dispatch_replies, frame_replies, RpcContext};
+use crate::rpc::{dispatch_replies, frame_replies, http_wait_max_wait, RpcContext};
 
 pub struct HttpMtProtoState {
     handshakes: Mutex<HashMap<[u8; 16], Handshake>>,
@@ -70,14 +70,9 @@ fn long_poll_delay(state: &AppState, payload: &[u8]) -> Result<Option<Duration>>
     if envelope.body.len() < 4 {
         return Ok(None);
     }
-    let ctor_bytes: [u8; 4] = envelope.body[0..4].try_into().unwrap_or([0; 4]);
-    if u32::from_le_bytes(ctor_bytes) != 0x9299_359f {
+    let Some(max_wait) = http_wait_max_wait(&envelope.body)? else {
         return Ok(None);
-    }
-    if envelope.body.len() < 16 {
-        return Ok(Some(Duration::from_millis(25_000)));
-    }
-    let max_wait = i32::from_le_bytes(envelope.body[12..16].try_into().unwrap()).clamp(0, 60_000);
+    };
     let user_id = state.store.session_user(auth_key_id(&key))?.unwrap_or(0);
     if user_id != 0
         && !state
